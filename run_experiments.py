@@ -146,7 +146,6 @@ def run_capacitance_vs_vref_sweep(
         vref_peak = vref_pp / 2.0
         Cs_base = 1.0e-12
 
-        # 1. Baseline test
         test_cfg = replace(
             base_cfg, Vref=vref_peak, sha_Cs=1.25*Cs_base, sha_Cf=1.25*Cs_base, sha_C_cmfb=0.15*Cs_base,
             Cs_profile=[Cs_base*tap for tap in taper_profile], mdac_C_cmfb=0.15*Cs_base
@@ -155,7 +154,6 @@ def run_capacitance_vs_vref_sweep(
         _, summary_test = adc_test.run_static_analysis()
         snr_base_linear = 10 ** (float(summary_test["Thermal SNR"].split()[0]) / 10.0)
 
-        # 2. Scale capacitors to hit target SNR
         target_snr_linear = 10 ** (target_snr_db / 10.0)
         Cs_scaled = Cs_base * (target_snr_linear / snr_base_linear)
 
@@ -205,7 +203,7 @@ def run_dnl_inl_experiment(base_cfg: ADCConfig, num_ramp_samples=300000):
     print(" EXPERIMENT 5: STATIC DNL / INL MEASUREMENT")
     print("="*70)
 
-    cfg = replace(base_cfg, sigma_cap_mismatch=0.001, sigma_comp_offset=0.012)
+    cfg = replace(base_cfg, sigma_cap_mismatch=0.001, sigma_comp_offset=0.012, sigma_a0_db=1.0)
     adc = FullPipelinedADCSimulator.from_config(cfg)
 
     print(f"Running linear ramp simulation with {num_ramp_samples:,} samples...")
@@ -242,7 +240,7 @@ def run_dnl_inl_experiment(base_cfg: ADCConfig, num_ramp_samples=300000):
 
 
 # ==============================================================================
-# MAIN EXECUTION: EASY PARAMETER SPECIFICATION
+# MAIN EXECUTION
 # ==============================================================================
 if __name__ == "__main__":
     
@@ -262,13 +260,13 @@ if __name__ == "__main__":
         mdac_C_cmfb=0.15e-12,
         Cs_profile=[2.0e-12, 1.2e-12, 0.8e-12, 0.5e-12, 0.3e-12, 0.2e-12, 0.2e-12, 0.2e-12],
         
-        # Non-idealities
-        sigma_cap_mismatch=0.001,
-        sigma_comp_offset=0.012,
-        sigma_vref_noise=0.0005
+        # Non-idealities & Mismatch Parameters
+        sigma_cap_mismatch=0.001,   # 0.1% C mismatch
+        sigma_comp_offset=0.012,    # 12 mV comparator offset
+        sigma_vref_noise=0.0005,    # 0.5 mV Vref noise
+        sigma_a0_db=1.0             # 1.0 dB OTA open-loop gain mismatch
     )
 
-    # Run experiments using the central config instance
     run_sanity_check(main_config)
     run_temperature_sweep(main_config)
     run_gamma_sweep(main_config)

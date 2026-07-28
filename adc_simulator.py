@@ -33,10 +33,11 @@ class ADCConfig:
     temp_celsius: float = 27.0       # Temperature (°C)
     gamma_transistor: float = 1.5    # Transistor excess noise factor
     
-    # Non-idealities & Noise
+    # Non-idealities & Mismatch
     sigma_cap_mismatch: float = 0.001   # Capacitor mismatch std dev (0.1%)
     sigma_comp_offset: float = 0.012    # Sub-ADC comp offset std dev (12 mV)
     sigma_vref_noise: float = 0.0005    # Vref noise std dev (0.5 mV RMS)
+    sigma_a0_db: float = 1.0            # OTA DC open-loop gain mismatch std dev in dB
     
     # Front-End SHA Parameters
     sha_Cs: float = 2.5e-12
@@ -65,14 +66,20 @@ class ConventionalSHA:
     """Conventional (Non-Flip-Around) Single-Ended to Differential S/H."""
     def __init__(
         self, Cs=2.5e-12, Cf=2.5e-12, Cp=0.15e-12, C_out_par=0.08e-12, 
-        C_cmfb=0.25e-12, A0_db=75.0, gm_over_id=12.0, gamma_transistor=1.5, temp_celsius=27.0
+        C_cmfb=0.25e-12, A0_db=75.0, sigma_a0_db=1.0, gm_over_id=12.0, 
+        gamma_transistor=1.5, temp_celsius=27.0
     ):
         self.Cs = Cs
         self.Cf = Cf
         self.Cp = Cp
         self.C_out_par = C_out_par
         self.C_cmfb = C_cmfb
-        self.A0 = 10 ** (A0_db / 20.0)
+        
+        # Apply random Gaussian variation to OTA DC gain in dB
+        A0_db_actual = A0_db + np.random.normal(0, sigma_a0_db)
+        self.A0_db = A0_db_actual
+        self.A0 = 10 ** (A0_db_actual / 20.0)
+        
         self.gm_over_id = gm_over_id
         self.gamma_transistor = gamma_transistor
         self.temp_kelvin = celsius_to_kelvin(temp_celsius)
@@ -127,10 +134,10 @@ class ConventionalSHA:
 # 2. PIPELINED MDAC STAGE
 # ==============================================================================
 class NonIdealMDACStage:
-    """1.5-Bit Differential MDAC Stage."""
+    """1.5-Bit Differential MDAC Stage with Cap Mismatch, Comp Offsets, Vref Noise, and A0 Gain Mismatch."""
     def __init__(
         self, stage_num, bits=1.5, Cs=1e-12, Cf=1e-12, Cp=0.1e-12, C_out_par=0.05e-12,
-        C_cmfb=0.15e-12, Vref=1.0, A0_db=65.0, gamma_transistor=1.5, gm_over_id=12.0,
+        C_cmfb=0.15e-12, Vref=1.0, A0_db=65.0, sigma_a0_db=1.0, gamma_transistor=1.5, gm_over_id=12.0,
         sigma_cap_mismatch=0.001, sigma_comp_offset=0.012, sigma_vref_noise=0.001, temp_celsius=27.0
     ):
         self.stage_num = stage_num
@@ -140,7 +147,12 @@ class NonIdealMDACStage:
         self.Cp = Cp
         self.C_out_par = C_out_par
         self.C_cmfb = C_cmfb
-        self.A0 = 10 ** (A0_db / 20.0)
+        
+        # Apply random Gaussian variation to open-loop DC gain A0 in dB
+        A0_db_actual = A0_db + np.random.normal(0, sigma_a0_db)
+        self.A0_db = A0_db_actual
+        self.A0 = 10 ** (A0_db_actual / 20.0)
+
         self.gamma_transistor = gamma_transistor
         self.gm_over_id = gm_over_id
         self.sigma_vref_noise = sigma_vref_noise
@@ -234,18 +246,19 @@ class FullPipelinedADCSimulator:
         """Constructs full simulator directly from an ADCConfig instance."""
         sha = ConventionalSHA(
             Cs=cfg.sha_Cs, Cf=cfg.sha_Cf, Cp=cfg.sha_Cp, C_out_par=cfg.sha_C_out_par,
-            C_cmfb=cfg.sha_C_cmfb, A0_db=cfg.sha_A0_db, gm_over_id=cfg.sha_gm_over_id,
-            gamma_transistor=cfg.gamma_transistor, temp_celsius=cfg.temp_celsius
+            C_cmfb=cfg.sha_C_cmfb, A0_db=cfg.sha_A0_db, sigma_a0_db=cfg.sigma_a0_db,
+            gm_over_id=cfg.sha_gm_over_id, gamma_transistor=cfg.gamma_transistor, 
+            temp_celsius=cfg.temp_celsius
         )
 
         stages = [
             NonIdealMDACStage(
                 stage_num=i + 1, bits=cfg.mdac_bits, Cs=cs_val, Cf=cs_val,
                 Cp=cfg.mdac_Cp, C_out_par=cfg.mdac_C_out_par, C_cmfb=cfg.mdac_C_cmfb,
-                Vref=cfg.Vref, A0_db=cfg.mdac_A0_db, gamma_transistor=cfg.gamma_transistor,
-                gm_over_id=cfg.mdac_gm_over_id, sigma_cap_mismatch=cfg.sigma_cap_mismatch,
-                sigma_comp_offset=cfg.sigma_comp_offset, sigma_vref_noise=cfg.sigma_vref_noise,
-                temp_celsius=cfg.temp_celsius
+                Vref=cfg.Vref, A0_db=cfg.mdac_A0_db, sigma_a0_db=cfg.sigma_a0_db,
+                gamma_transistor=cfg.gamma_transistor, gm_over_id=cfg.mdac_gm_over_id, 
+                sigma_cap_mismatch=cfg.sigma_cap_mismatch, sigma_comp_offset=cfg.sigma_comp_offset, 
+                sigma_vref_noise=cfg.sigma_vref_noise, temp_celsius=cfg.temp_celsius
             ) for i, cs_val in enumerate(cfg.Cs_profile)
         ]
 
@@ -260,9 +273,9 @@ class FullPipelinedADCSimulator:
         )
         results.append({
             "Stage": "SHA", "Cs (pF)": self.sha.Cs*1e12, "Cf (pF)": self.sha.Cf*1e12, 
-            "Beta": round(self.sha.beta, 3), "GBW (MHz)": round(sha_specs["GBW_MHz"], 1), 
-            "gm (mS)": round(sha_specs["gm_mS"], 2), "C_eff (pF)": round(sha_specs["C_load_eff_pF"], 3), 
-            "OTA Power (mW)": round(sha_specs["Power_mW"], 2)
+            "Beta": round(self.sha.beta, 3), "A0 (dB)": round(self.sha.A0_db, 2),
+            "GBW (MHz)": round(sha_specs["GBW_MHz"], 1), "gm (mS)": round(sha_specs["gm_mS"], 2), 
+            "C_eff (pF)": round(sha_specs["C_load_eff_pF"], 3), "OTA Power (mW)": round(sha_specs["Power_mW"], 2)
         })
 
         total_noise_sq = 0.0
@@ -282,9 +295,9 @@ class FullPipelinedADCSimulator:
 
             results.append({
                 "Stage": f"MDAC {i+1}", "Cs (pF)": round(stage.Cs*1e12, 3), "Cf (pF)": round(stage.Cf*1e12, 3), 
-                "Beta": round(stage.beta, 3), "GBW (MHz)": round(specs["GBW_MHz"], 1), 
-                "gm (mS)": round(specs["gm_mS"], 2), "C_eff (pF)": round(specs["C_load_eff_pF"], 3), 
-                "OTA Power (mW)": round(specs["Power_mW"], 2)
+                "Beta": round(stage.beta, 3), "A0 (dB)": round(stage.A0_db, 2),
+                "GBW (MHz)": round(specs["GBW_MHz"], 1), "gm (mS)": round(specs["gm_mS"], 2), 
+                "C_eff (pF)": round(specs["C_load_eff_pF"], 3), "OTA Power (mW)": round(specs["Power_mW"], 2)
             })
             cumulative_gain *= stage.actual_gain
 
