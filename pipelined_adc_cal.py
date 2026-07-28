@@ -562,7 +562,7 @@ def run_design_space_exploration():
     fig2, ((ax2_1, ax2_2), (ax2_3, ax2_4)) = plt.subplots(2, 2, figsize=(13, 9.5))
 
     # Panel 1: SNDR vs Datapath Register Wordlength (B_reg)
-    ax2_1.plot(reg_bits_range, sndr_vs_reg_bits, 'o-', color='tab:indigo', lw=2)
+    ax2_1.plot(reg_bits_range, sndr_vs_reg_bits, 'o-', color='indigo', lw=2)
     ax2_1.set_xlabel("Hardware Register Bitwidth B_reg (Bits)", fontsize=10)
     ax2_1.set_ylabel("Calibrated Dynamic SNDR (dB)", fontsize=10)
     ax2_1.set_title("1. Performance vs. Hardware Register Wordlength", fontweight='bold')
