@@ -1,6 +1,6 @@
 # adc_simulator.py
 from dataclasses import dataclass, field
-from typing import List
+from typing import List, Optional
 import numpy as np
 import pandas as pd
 
@@ -15,7 +15,12 @@ def celsius_to_kelvin(temp_celsius):
 # ==============================================================================
 @dataclass
 class ADCConfig:
-    """Master configuration class for Pipelined ADC parameters."""
+    """Main configuration class for Pipelined ADC parameters."""
+    # Pipeline Architecture
+    num_stages: int = 8              # Number of MDAC stages (proxy for resolution)
+    mdac_bits: float = 1.5           # Stage resolution (1.5-bit per MDAC)
+    quantizer_bits: int = 2          # Back-end flash quantizer bits
+    
     # Supply & References
     Vref: float = 1.0                # Peak reference voltage (Volts)
     Vdd: float = 1.2                 # Supply voltage (Volts)
@@ -25,11 +30,12 @@ class ADCConfig:
     f_clk: float = 100e6             # Clock frequency (Hz)
     t_non_overlap: float = 0.4e-9    # Non-overlapping clock time (seconds)
     
-    # Resolution Specs
-    quantizer_bits: int = 2          # Back-end flash quantizer bits
-    mdac_bits: float = 1.5           # Stage resolution (1.5-bit per MDAC)
+    # Transistor Efficiency & Technology
+    gm_over_id: float = 12.0         # Default gm/ID efficiency (V^-1)
+    sha_gm_over_id: Optional[float] = None     # Optional SHA override
+    mdac_gm_over_id: Optional[float] = None    # Optional global MDAC override
+    gm_over_id_profile: Optional[List[float]] = None  # Optional per-stage profile
     
-    # Environmental & Transistor Technology
     temp_celsius: float = 27.0       # Temperature (°C)
     gamma_transistor: float = 1.5    # Transistor excess noise factor
     
@@ -46,7 +52,6 @@ class ADCConfig:
     sha_C_out_par: float = 0.08e-12
     sha_C_cmfb: float = 0.25e-12
     sha_A0_db: float = 75.0
-    sha_gm_over_id: float = 12.0
     
     # MDAC Stage Default Parameters
     Cs_profile: List[float] = field(default_factory=lambda: [
@@ -56,7 +61,6 @@ class ADCConfig:
     mdac_C_out_par: float = 0.05e-12
     mdac_C_cmfb: float = 0.15e-12
     mdac_A0_db: float = 65.0
-    mdac_gm_over_id: float = 12.0
 
 
 # ==============================================================================
@@ -75,7 +79,6 @@ class ConventionalSHA:
         self.C_out_par = C_out_par
         self.C_cmfb = C_cmfb
         
-        # Apply random Gaussian variation to OTA DC gain in dB
         A0_db_actual = A0_db + np.random.normal(0, sigma_a0_db)
         self.A0_db = A0_db_actual
         self.A0 = 10 ** (A0_db_actual / 20.0)
@@ -126,7 +129,9 @@ class ConventionalSHA:
         }
 
     def process_signal(self, Vin_se, Vcm_in=0.5):
-        Vin_diff = Vin_se - Vcm_in
+        # Inject input-referred thermal noise sample
+        v_noise = np.random.normal(0, np.sqrt(self.input_referred_noise_sq))
+        Vin_diff = (Vin_se - Vcm_in) + v_noise
         return Vin_diff * self.actual_gain
 
 
@@ -134,7 +139,7 @@ class ConventionalSHA:
 # 2. PIPELINED MDAC STAGE
 # ==============================================================================
 class NonIdealMDACStage:
-    """1.5-Bit Differential MDAC Stage with Cap Mismatch, Comp Offsets, Vref Noise, and A0 Gain Mismatch."""
+    """1.5-Bit Differential MDAC Stage."""
     def __init__(
         self, stage_num, bits=1.5, Cs=1e-12, Cf=1e-12, Cp=0.1e-12, C_out_par=0.05e-12,
         C_cmfb=0.15e-12, Vref=1.0, A0_db=65.0, sigma_a0_db=1.0, gamma_transistor=1.5, gm_over_id=12.0,
@@ -148,7 +153,6 @@ class NonIdealMDACStage:
         self.C_out_par = C_out_par
         self.C_cmfb = C_cmfb
         
-        # Apply random Gaussian variation to open-loop DC gain A0 in dB
         A0_db_actual = A0_db + np.random.normal(0, sigma_a0_db)
         self.A0_db = A0_db_actual
         self.A0 = 10 ** (A0_db_actual / 20.0)
@@ -212,28 +216,32 @@ class NonIdealMDACStage:
     def process_sample(self, Vin):
         vref_sample = self.Vref + np.random.normal(0, self.sigma_vref_noise)
 
-        if Vin > self.vth_hi:
+        # Inject stage input-referred thermal noise sample
+        v_noise = np.random.normal(0, np.sqrt(self.input_referred_noise_sq))
+        Vin_noisy = Vin + v_noise
+
+        if Vin_noisy > self.vth_hi:
             D = 1
-        elif Vin < self.vth_lo:
+        elif Vin_noisy < self.vth_lo:
             D = -1
         else:
             D = 0
 
         loop_gain = self.A0 * self.beta
         gain_factor = loop_gain / (1.0 + loop_gain)
-        
+    
         G_stage = (1.0 + (self.Cs / self.Cf)) * gain_factor
         Vdac = D * (self.Cs / self.Cf) * vref_sample * gain_factor
-        
-        Vres = (Vin * G_stage) - Vdac
+    
+        Vres = (Vin_noisy * G_stage) - Vdac
         return D, Vres
 
 
 # ==============================================================================
-# 3. MASTER PIPELINE SIMULATOR
+# 3. MAIN PIPELINE SIMULATOR
 # ==============================================================================
 class FullPipelinedADCSimulator:
-    """Master Pipeline ADC System."""
+    """Main Pipeline ADC System."""
     def __init__(self, sha, stages, quantizer_bits=2, Vdd=1.2):
         self.sha = sha
         self.stages = stages
@@ -244,23 +252,43 @@ class FullPipelinedADCSimulator:
     @classmethod
     def from_config(cls, cfg: ADCConfig):
         """Constructs full simulator directly from an ADCConfig instance."""
+        sha_gm_id = cfg.sha_gm_over_id if cfg.sha_gm_over_id is not None else cfg.gm_over_id
+
         sha = ConventionalSHA(
             Cs=cfg.sha_Cs, Cf=cfg.sha_Cf, Cp=cfg.sha_Cp, C_out_par=cfg.sha_C_out_par,
             C_cmfb=cfg.sha_C_cmfb, A0_db=cfg.sha_A0_db, sigma_a0_db=cfg.sigma_a0_db,
-            gm_over_id=cfg.sha_gm_over_id, gamma_transistor=cfg.gamma_transistor, 
+            gm_over_id=sha_gm_id, gamma_transistor=cfg.gamma_transistor, 
             temp_celsius=cfg.temp_celsius
         )
 
-        stages = [
-            NonIdealMDACStage(
-                stage_num=i + 1, bits=cfg.mdac_bits, Cs=cs_val, Cf=cs_val,
-                Cp=cfg.mdac_Cp, C_out_par=cfg.mdac_C_out_par, C_cmfb=cfg.mdac_C_cmfb,
-                Vref=cfg.Vref, A0_db=cfg.mdac_A0_db, sigma_a0_db=cfg.sigma_a0_db,
-                gamma_transistor=cfg.gamma_transistor, gm_over_id=cfg.mdac_gm_over_id, 
-                sigma_cap_mismatch=cfg.sigma_cap_mismatch, sigma_comp_offset=cfg.sigma_comp_offset, 
-                sigma_vref_noise=cfg.sigma_vref_noise, temp_celsius=cfg.temp_celsius
-            ) for i, cs_val in enumerate(cfg.Cs_profile)
-        ]
+        # Adapt Cs_profile to match cfg.num_stages
+        cs_profile = list(cfg.Cs_profile)
+        if len(cs_profile) < cfg.num_stages:
+            last_val = cs_profile[-1] if len(cs_profile) > 0 else 0.2e-12
+            cs_profile.extend([last_val] * (cfg.num_stages - len(cs_profile)))
+        elif len(cs_profile) > cfg.num_stages:
+            cs_profile = cs_profile[:cfg.num_stages]
+
+        stages = []
+        for i in range(cfg.num_stages):
+            cs_val = cs_profile[i]
+            if cfg.gm_over_id_profile is not None and i < len(cfg.gm_over_id_profile):
+                stage_gm_id = cfg.gm_over_id_profile[i]
+            elif cfg.mdac_gm_over_id is not None:
+                stage_gm_id = cfg.mdac_gm_over_id
+            else:
+                stage_gm_id = cfg.gm_over_id
+
+            stages.append(
+                NonIdealMDACStage(
+                    stage_num=i + 1, bits=cfg.mdac_bits, Cs=cs_val, Cf=cs_val,
+                    Cp=cfg.mdac_Cp, C_out_par=cfg.mdac_C_out_par, C_cmfb=cfg.mdac_C_cmfb,
+                    Vref=cfg.Vref, A0_db=cfg.mdac_A0_db, sigma_a0_db=cfg.sigma_a0_db,
+                    gamma_transistor=cfg.gamma_transistor, gm_over_id=stage_gm_id, 
+                    sigma_cap_mismatch=cfg.sigma_cap_mismatch, sigma_comp_offset=cfg.sigma_comp_offset, 
+                    sigma_vref_noise=cfg.sigma_vref_noise, temp_celsius=cfg.temp_celsius
+                )
+            )
 
         return cls(sha=sha, stages=stages, quantizer_bits=cfg.quantizer_bits, Vdd=cfg.Vdd)
 
@@ -274,6 +302,7 @@ class FullPipelinedADCSimulator:
         results.append({
             "Stage": "SHA", "Cs (pF)": self.sha.Cs*1e12, "Cf (pF)": self.sha.Cf*1e12, 
             "Beta": round(self.sha.beta, 3), "A0 (dB)": round(self.sha.A0_db, 2),
+            "gm/ID (V^-1)": round(self.sha.gm_over_id, 1),
             "GBW (MHz)": round(sha_specs["GBW_MHz"], 1), "gm (mS)": round(sha_specs["gm_mS"], 2), 
             "C_eff (pF)": round(sha_specs["C_load_eff_pF"], 3), "OTA Power (mW)": round(sha_specs["Power_mW"], 2)
         })
@@ -296,6 +325,7 @@ class FullPipelinedADCSimulator:
             results.append({
                 "Stage": f"MDAC {i+1}", "Cs (pF)": round(stage.Cs*1e12, 3), "Cf (pF)": round(stage.Cf*1e12, 3), 
                 "Beta": round(stage.beta, 3), "A0 (dB)": round(stage.A0_db, 2),
+                "gm/ID (V^-1)": round(stage.gm_over_id, 1),
                 "GBW (MHz)": round(specs["GBW_MHz"], 1), "gm (mS)": round(specs["gm_mS"], 2), 
                 "C_eff (pF)": round(specs["C_load_eff_pF"], 3), "OTA Power (mW)": round(specs["Power_mW"], 2)
             })
@@ -306,7 +336,7 @@ class FullPipelinedADCSimulator:
         snr_db = 10 * np.log10(P_signal / total_noise_sq)
 
         summary = {
-            "Total ADC Resolution": f"{self.total_bits} Bits",
+            "Total ADC Resolution": f"{self.total_bits} Bits ({len(self.stages)} MDAC Stages)",
             "Thermal SNR": f"{snr_db:.2f} dB",
             "Thermal ENOB": f"{(snr_db - 1.76) / 6.02:.2f} bits",
             "Total OTA Power": f"{sum(r['OTA Power (mW)'] for r in results):.2f} mW"

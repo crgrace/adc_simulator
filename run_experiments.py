@@ -139,7 +139,12 @@ def run_capacitance_vs_vref_sweep(
     print(f" EXPERIMENT 4: CONSTANT SNR ({target_snr_db} dB) VREF SWEEP")
     print("="*70)
 
-    taper_profile = [1.0, 0.6, 0.4, 0.25, 0.15, 0.1, 0.1, 0.1]
+    default_taper = [1.0, 0.6, 0.4, 0.25, 0.15, 0.1, 0.1, 0.1]
+    if len(default_taper) >= base_cfg.num_stages:
+        taper_profile = default_taper[:base_cfg.num_stages]
+    else:
+        taper_profile = default_taper + [default_taper[-1]] * (base_cfg.num_stages - len(default_taper))
+
     total_caps_pF = []
 
     for vref_pp in vref_pp_range:
@@ -240,13 +245,163 @@ def run_dnl_inl_experiment(base_cfg: ADCConfig, num_ramp_samples=300000):
 
 
 # ==============================================================================
+# EXPERIMENT 6: COMPREHENSIVE GM/ID TRADE-OFF ANALYSIS
+# (1. Max Speed at Fixed Power | 2. Min Power at Fixed Speed | 3. Walden FOM)
+# ==============================================================================
+def run_gm_over_id_sweep(
+    base_cfg: ADCConfig, 
+    gm_id_range=np.linspace(6.0, 20.0, 25)
+):
+    print("\n" + "="*70)
+    print(" EXPERIMENT 6: GM/ID TRADE-OFF ANALYSIS")
+    print("="*70)
+
+    # --------------------------------------------------------------------------
+    # PART A: FIXED CLOCK SPEED (f_clk = 100 MHz) -> Power & Walden FOM
+    # --------------------------------------------------------------------------
+    power_fixed_fclk_mW = []
+    fom_walden_fJ = []
+    enob_list = []
+
+    for gm_id in gm_id_range:
+        # Parasitic cap scales quadratically in weak/subthreshold inversion
+        cp_scale = (gm_id / base_cfg.gm_over_id) ** 2
+        
+        cfg = replace(
+            base_cfg,
+            gm_over_id=gm_id,
+            sha_Cp=base_cfg.sha_Cp * cp_scale,
+            mdac_Cp=base_cfg.mdac_Cp * cp_scale
+        )
+        adc = FullPipelinedADCSimulator.from_config(cfg)
+
+        # Static power and thermal ENOB for target f_clk
+        _, summary = adc.run_static_analysis(f_clk=cfg.f_clk, t_non_overlap=cfg.t_non_overlap)
+        p_mW = float(summary["Total OTA Power"].split()[0])
+        enob = float(summary["Thermal ENOB"].split()[0])
+
+        # Walden FOM in fJ/conv-step: P / (2^ENOB * f_clk)
+        p_watts = p_mW * 1e-3
+        fom_fJ = (p_watts / ((2 ** enob) * cfg.f_clk)) * 1e15
+
+        power_fixed_fclk_mW.append(p_mW)
+        enob_list.append(enob)
+        fom_walden_fJ.append(fom_fJ)
+
+    # Find optimal Walden FOM sweet spot
+    opt_idx = np.argmin(fom_walden_fJ)
+    opt_gm_id = gm_id_range[opt_idx]
+    opt_fom = fom_walden_fJ[opt_idx]
+
+    # --------------------------------------------------------------------------
+    # PART B: FIXED POWER (Fixed Tail Current) -> Max Sampling Frequency
+    # --------------------------------------------------------------------------
+    # Establish baseline tail currents at base_cfg.gm_over_id
+    adc_base = FullPipelinedADCSimulator.from_config(base_cfg)
+    sha_base_specs = adc_base.sha.calculate_settling_and_gm(
+        Cs_next_stage=adc_base.stages[0].Cs, total_adc_bits=adc_base.total_bits,
+        f_clk=base_cfg.f_clk, t_non_overlap=base_cfg.t_non_overlap, Vdd=base_cfg.Vdd
+    )
+    base_itail_sha = sha_base_specs["gm_mS"] * 1e-3 / adc_base.sha.gm_over_id
+
+    mdac_base_itails = []
+    for i, stage in enumerate(adc_base.stages):
+        cs_next = adc_base.stages[i+1].Cs if (i + 1 < len(adc_base.stages)) else 0.0
+        bits_rem = sum(s.effective_bits for s in adc_base.stages[i:]) + adc_base.quantizer_bits
+        specs = stage.calculate_settling_and_gm(
+            Cs_next_stage=cs_next, remaining_bits=bits_rem,
+            f_clk=base_cfg.f_clk, t_non_overlap=base_cfg.t_non_overlap, Vdd=base_cfg.Vdd
+        )
+        mdac_base_itails.append(specs["gm_mS"] * 1e-3 / stage.gm_over_id)
+
+    f_clk_max_MHz = []
+
+    for gm_id in gm_id_range:
+        cp_scale = (gm_id / base_cfg.gm_over_id) ** 2
+        cfg = replace(
+            base_cfg, gm_over_id=gm_id,
+            sha_Cp=base_cfg.sha_Cp * cp_scale, mdac_Cp=base_cfg.mdac_Cp * cp_scale
+        )
+        adc = FullPipelinedADCSimulator.from_config(cfg)
+
+        # Calculate SHA settling time with fixed tail current
+        gm_sha = base_itail_sha * gm_id
+        cl_sha = adc.sha.calculate_cl_load(adc.stages[0].Cs)
+        beta_sha = adc.sha.beta
+        tau_sha = cl_sha / (2.0 * np.pi * beta_sha * gm_sha)
+        n_tau_sha = (adc.total_bits + 1.0) * np.log(2.0)
+        t_settle_sha = n_tau_sha * tau_sha
+
+        # Calculate MDAC settling times with fixed tail currents
+        t_settle_mdacs = []
+        for i, stage in enumerate(adc.stages):
+            cs_next = adc.stages[i+1].Cs if (i + 1 < len(adc.stages)) else 0.0
+            bits_rem = sum(s.effective_bits for s in adc.stages[i:]) + adc.quantizer_bits
+            gm_stage = mdac_base_itails[i] * gm_id
+            cl_stage = stage.calculate_cl_load(cs_next)
+            beta_stage = stage.beta
+            tau_stage = cl_stage / (2.0 * np.pi * beta_stage * gm_stage)
+            n_tau_stage = (bits_rem + 1.0) * np.log(2.0)
+            t_settle_mdacs.append(n_tau_stage * tau_stage)
+
+        # Bottleneck stage defines maximum clock frequency
+        t_settle_max = max(t_settle_sha, max(t_settle_mdacs))
+        t_clk_min = 2.0 * (t_settle_max + cfg.t_non_overlap)
+        f_max = 1.0 / t_clk_min
+        f_clk_max_MHz.append(f_max / 1e6)
+
+        print(f"  gm/ID = {gm_id:>5.1f} V^-1  |  Power = {power_fixed_fclk_mW[len(f_clk_max_MHz)-1]:>5.2f} mW  |  Max f_clk = {f_max/1e6:>6.1f} MHz  |  FOM = {fom_walden_fJ[len(f_clk_max_MHz)-1]:>6.1f} fJ/step")
+
+    print(f"\n  ---> Walden FOM Sweet Spot: {opt_fom:.1f} fJ/conv-step at gm/ID = {opt_gm_id:.1f} V^-1")
+
+    # --------------------------------------------------------------------------
+    # PLOTTING THE THREE TRADEOFFS
+    # --------------------------------------------------------------------------
+    fig, (ax1, ax2, ax3) = plt.subplots(1, 3, figsize=(16, 4.8))
+
+    # Panel 1: Max Speed at Fixed Power
+    ax1.plot(gm_id_range, f_clk_max_MHz, 'o-', color='tab:red', lw=2)
+    ax1.set_title("1. Max Clock Speed (Fixed Power)", fontsize=11, fontweight='bold')
+    ax1.set_xlabel("gm/ID Efficiency (V^-1)", fontsize=10)
+    ax1.set_ylabel("Max Clock Frequency f_clk_max (MHz)", fontsize=10)
+    ax1.grid(True, linestyle=':', alpha=0.6)
+
+    # Panel 2: Required Power at Fixed Speed (100 MHz)
+    ax2.plot(gm_id_range, power_fixed_fclk_mW, 's-', color='tab:blue', lw=2)
+    ax2.set_title("2. Required Power (Fixed 100 MHz Clock)", fontsize=11, fontweight='bold')
+    ax2.set_xlabel("gm/ID Efficiency (V^-1)", fontsize=10)
+    ax2.set_ylabel("Total OTA Power (mW)", fontsize=10)
+    ax2.grid(True, linestyle=':', alpha=0.6)
+
+    # Panel 3: Walden Figure of Merit (Sweet Spot)
+    ax3.plot(gm_id_range, fom_walden_fJ, 'd-', color='tab:green', lw=2, label='Walden FOM')
+    ax3.axvline(opt_gm_id, color='crimson', linestyle='--', lw=1.2, label=f'Sweet Spot ({opt_gm_id:.1f} V^-1)')
+    ax3.set_title("3. Walden FOM Sweet Spot", fontsize=11, fontweight='bold')
+    ax3.set_xlabel("gm/ID Efficiency (V^-1)", fontsize=10)
+    ax3.set_ylabel("Walden FOM (fJ/conv-step)", fontsize=10)
+    ax3.grid(True, linestyle=':', alpha=0.6)
+    ax3.legend(loc='upper right')
+
+    plt.suptitle("Pipelined ADC Transconductance Efficiency (gm/ID) Trade-Off Analysis", fontsize=13, fontweight='bold')
+    plt.tight_layout()
+    plt.show()
+
+
+# ==============================================================================
 # MAIN EXECUTION
 # ==============================================================================
 if __name__ == "__main__":
+
+    # ------------------------------------------------------------------------------
+    # CONFIG 0: 1.2V Thin-Oxide Devices (65nm Process, L = 65nm)
+    # High Speed, Larger Sampling Capacitors, Lower Reference Swing
+    # ------------------------------------------------------------------------------
     
     main_config = ADCConfig(
+        num_stages=8,               # 8 MDAC stages (10 bits resolution total)
         Vref=1.0,
         Vdd=1.2,
+        gm_over_id=12.0,            # Default gm/ID efficiency (12 V^-1)
         temp_celsius=27.0,
         gamma_transistor=1.5,
         
@@ -266,10 +421,85 @@ if __name__ == "__main__":
         sigma_vref_noise=0.0005,    # 0.5 mV Vref noise
         sigma_a0_db=1.0             # 1.0 dB OTA open-loop gain mismatch
     )
+    
+    # ------------------------------------------------------------------------------
+    # CONFIG 1: 1.2V Thin-Oxide Devices (65nm Process, L = 65nm)
+    # High Speed, Larger Sampling Capacitors, Lower Reference Swing
+    # ------------------------------------------------------------------------------
+    process_65nm_1v2_config = ADCConfig(
+        num_stages=8,               # 8 MDAC stages (10 bits total)
+        Vdd=1.2,                    # 1.2V Core Supply
+        Vref=0.5,                   # 1.0V Peak-to-Peak Differential Swing
+        Vcm_in=0.6,                 # Mid-supply common mode (0.6V)
+        f_clk=150e6,                # High sampling rate (150 MHz target)
+        t_non_overlap=0.3e-9,       # Faster clock transitions
+    
+        # Transistor technology specs (Thin-oxide short-channel)
+        gm_over_id=12.0,
+        # Higher noise factor due to hot carriers / velocity saturation
+        gamma_transistor=1.6,
+    
+        # Capacitors (Larger Cs required to offset smaller 1.0Vpp signal swing)
+        sha_Cs=2.5e-12,             # 2.5 pF required for ~70 dB SNR
+        sha_Cf=2.5e-12,
+        sha_Cp=0.10e-12,            # Small parasitic cap (small L = 65nm)
+        sha_C_cmfb=0.20e-12,
+        sha_A0_db=70.0,             # Harder to get high gain in short channel
+    
+        # MDAC stage caps (scaled up for thermal noise)
+        Cs_profile=[2.0e-12, 1.2e-12, 0.8e-12, 0.5e-12,
+                    0.3e-12, 0.2e-12, 0.2e-12, 0.2e-12],
+        mdac_Cp=0.10e-12,           # Low parasitic cap
+        mdac_C_cmfb=0.15e-12,
+        mdac_A0_db=62.0,            # 62 dB gain
+    
+        # Non-idealities & Mismatch
+        sigma_cap_mismatch=0.0010,  # 0.1% C mismatch
+        sigma_comp_offset=0.012,    # 12 mV comparator offset
+        sigma_vref_noise=0.0005,    # 0.5 mV Vref noise
+        sigma_a0_db=1.0
+    )
+    
+    # ------------------------------------------------------------------------------
+    # CONFIG 2: 2.5V Thick-Oxide Devices (65nm Process, L = 280nm)
+    # Lower Speed, Small Sampling Capacitors, Large Reference Swing
+    # ------------------------------------------------------------------------------
+    process_65nm_2v5_config = ADCConfig(
+        num_stages=8,               # 8 MDAC stages (10 bits total)
+        Vdd=2.5,                    # 2.5V I/O Supply
+        Vref=1.2,                   # 2.4V Peak-to-Peak Differential Swing
+        Vcm_in=1.25,                # Mid-supply common mode (1.25V)
+        f_clk=80e6,                 # Lower sampling rate limit (80 MHz target)
+        t_non_overlap=0.5e-9,       
+        
+        # Transistor technology specs (Thick-oxide long-channel)
+        gm_over_id=12.0,            
+        gamma_transistor=1.1,       # Lower noise factor (less velocity saturation)
+        
+        # Capacitors (Much smaller Cs thanks to 2.4Vpp swing!)
+        sha_Cs=0.6e-12,             # 0.6 pF achieves same SNR as 2.5 pF at 1.2V
+        sha_Cf=0.6e-12,
+        sha_Cp=0.40e-12,            # Larger parasitic cap (~4x higher due to L = 280nm)
+        sha_C_cmfb=0.15e-12,
+        sha_A0_db=75.0,             # High open-loop gain easily achieved
+        
+        # MDAC stage caps (scaled down)
+        Cs_profile=[0.5e-12, 0.3e-12, 0.2e-12, 0.15e-12, 0.1e-12, 0.1e-12, 0.1e-12, 0.1e-12],
+        mdac_Cp=0.30e-12,           # Higher parasitic cap
+        mdac_C_cmfb=0.10e-12,
+        mdac_A0_db=68.0,            # 68 dB gain
+        
+        # Non-idealities & Mismatch
+        sigma_cap_mismatch=0.0008,  # Slightly better matching at 2.5V
+        sigma_comp_offset=0.015,    # 15 mV comparator offset
+        sigma_vref_noise=0.0008,    # 0.8 mV Vref noise
+        sigma_a0_db=0.8
+    )    
 
     run_sanity_check(main_config)
     run_temperature_sweep(main_config)
     run_gamma_sweep(main_config)
     run_vref_noise_sweep(main_config, max_vref_noise_mv=2.0, num_points=20)
     run_capacitance_vs_vref_sweep(main_config)
-    run_dnl_inl_experiment(main_config)
+    run_dnl_inl_experiment(main_config,num_ramp_samples=100*pow((main_config.num_stages+2),2))
+    run_gm_over_id_sweep(main_config)
