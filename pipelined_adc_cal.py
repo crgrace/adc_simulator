@@ -254,7 +254,7 @@ class calADC:
                     Y_k_0 = Y_down_0_pos >> 1
                     Y_k_1 = (Y_down_1_pos >> 1) + w_pos_dp
                     
-                    e_pos = Y_k_0 - Y_k_1  # Error in Q(dp_frac)
+                    e_pos = Y_k_0 - Y_k_1
                     e_pos_w = self._align_frac(e_pos, self.cfg.datapath_frac_bits, self.cfg.weight_frac_bits)
                     delta_w = e_pos_w >> self.cfg.mu_shift
                     w_pos = self._saturate_int(w_pos + delta_w, self.cfg.weight_bits)
@@ -407,11 +407,11 @@ class calADC:
 
 
 # ==============================================================================
-# 4. DESIGN SPACE EXPLORATION STUDY (UNIFIED REGISTER WIDTH SWEEPS)
+# 4. DESIGN SPACE EXPLORATION STUDY (SYSTEM + HARDWARE SWEEPS)
 # ==============================================================================
 def run_design_space_exploration():
     print("="*75)
-    print(" calADC HARDWARE WORDLENGTH STUDY (INTEGER ARITHMETIC)")
+    print(" calADC DESIGN SPACE EXPLORATION STUDY (INTEGER ARITHMETIC)")
     print(" 16-Stage All-1.5b MDAC Pipeline Architecture (17-Bit Nominal)")
     print("="*75)
 
@@ -424,7 +424,7 @@ def run_design_space_exploration():
         Vref=1.2,                    # 1.2V reference (2.4 Vpp diff)
         Vcm_in=1.25,                 # Mid-supply common mode
         
-        # Integer Arithmetic Settings
+        # Fixed-Point Integer Settings
         use_fixed_point=True,
         datapath_bits=20,            # 20-bit datapath (Q2.18)
         weight_bits=22,              # 22-bit weight accumulator (Q2.20)
@@ -438,7 +438,9 @@ def run_design_space_exploration():
         seed=42
     )
 
-    # 1. Baseline System Evaluation
+    # --------------------------------------------------------------------------
+    # 1. BASELINE EVALUATION
+    # --------------------------------------------------------------------------
     adc_base = calADC.from_config(base_cfg)
     sndr_uncal, sfdr_uncal, enob_uncal, spec_uncal, _ = adc_base.run_transient_sine(use_calibrated=False)
     code_axis_u, dnl_u, inl_u = adc_base.run_ramp_dnl_inl(use_calibrated=False)
@@ -460,24 +462,46 @@ def run_design_space_exploration():
     print(f"  Max |DNL|    : {np.max(np.abs(dnl_cal)):.2f} LSB")
     print(f"  Max |INL|    : {np.max(np.abs(inl_cal)):.2f} LSB")
 
-    # 2. SWEEP 1: Unified Hardware Register Width Sweep (B_reg from 12 to 24 bits)
-    print("\nExecuting Experiment 1: Unified Register Width (B_reg) Sweep...")
+    # --------------------------------------------------------------------------
+    # 2. SYSTEM SWEEPS (FIXED BITWIDTH)
+    # --------------------------------------------------------------------------
+    print("\nExecuting System Sweep 1: Number of Calibrated Stages Sweep...")
+    cal_stage_range = list(range(0, 11))
+    sndr_vs_stages = []
+    for num_c in cal_stage_range:
+        cfg_sweep = replace(base_cfg, num_calibrated_stages=num_c)
+        adc_sweep = calADC.from_config(cfg_sweep)
+        if num_c > 0:
+            adc_sweep.run_calibration()
+        s_val, _, _, _, _ = adc_sweep.run_transient_sine(use_calibrated=(num_c > 0))
+        sndr_vs_stages.append(s_val)
+
+    print("Executing System Sweep 2: Calibration Loop Cycles Sweep...")
+    cycles_range = [200, 500, 1000, 1500, 2500, 4000]
+    sndr_vs_cycles = []
+    for cyc in cycles_range:
+        cfg_sweep = replace(base_cfg, cal_cycles_per_stage=cyc)
+        adc_sweep = calADC.from_config(cfg_sweep)
+        adc_sweep.run_calibration()
+        s_val, _, _, _, _ = adc_sweep.run_transient_sine(use_calibrated=True)
+        sndr_vs_cycles.append(s_val)
+
+    # --------------------------------------------------------------------------
+    # 3. HARDWARE WORDLENGTH SWEEPS
+    # --------------------------------------------------------------------------
+    print("\nExecuting Hardware Sweep 1: Unified Register Width (B_reg) Sweep...")
     reg_bits_range = list(range(12, 25, 2))
     sndr_vs_reg_bits = []
-    
     for b_reg in reg_bits_range:
-        # Datapath = B_reg, Weights = B_reg + 2 (sub-LSB accumulation bits)
         cfg_sweep = replace(base_cfg, datapath_bits=b_reg, weight_bits=b_reg + 2)
         adc_sweep = calADC.from_config(cfg_sweep)
         adc_sweep.run_calibration()
         s_val, _, _, _, _ = adc_sweep.run_transient_sine(use_calibrated=True)
         sndr_vs_reg_bits.append(s_val)
 
-    # 3. SWEEP 2: Calibration Loop Step Size Shift (mu_shift from 3 to 10)
-    print("Executing Experiment 2: LMS Step-Size Shift (mu_shift) Sweep...")
+    print("Executing Hardware Sweep 2: LMS Step-Size Shift (mu_shift) Sweep...")
     mu_shifts_range = list(range(3, 11))
     sndr_vs_mu_shift = []
-    
     for s_mu in mu_shifts_range:
         cfg_sweep = replace(base_cfg, mu_shift=s_mu)
         adc_sweep = calADC.from_config(cfg_sweep)
@@ -485,18 +509,18 @@ def run_design_space_exploration():
         s_val, _, _, _, _ = adc_sweep.run_transient_sine(use_calibrated=True)
         sndr_vs_mu_shift.append(s_val)
 
-    # --------------------------------------------------------------------------
-    # DASHBOARD PLOTS
-    # --------------------------------------------------------------------------
-    fig, ((ax1, ax2), (ax3, ax4)) = plt.subplots(2, 2, figsize=(13, 9.5))
+    # ==========================================================================
+    # FIGURE 1: SYSTEM & ALGORITHM CALIBRATION DASHBOARD
+    # ==========================================================================
+    fig1, ((ax1, ax2), (ax3, ax4)) = plt.subplots(2, 2, figsize=(13, 9.5))
 
-    # Panel 1: LMS Weight Convergence Traces (Integer Weights mapped to Float Scale)
+    # Panel 1: LMS Weight Convergence Traces
     for stg in sorted(history.keys()):
         ax1.plot(history[stg]["w_pos"], label=f'Stage {stg} W+')
     ax1.axhline(0.5, color='black', linestyle='--', alpha=0.6, label='Ideal RSD (0.5)')
     ax1.set_xlabel("Calibration Iterations / Cycles", fontsize=10)
     ax1.set_ylabel("Learned Weight W+ (Normalized)", fontsize=10)
-    ax1.set_title(f"1. Integer LMS Weight Convergence ({base_cfg.weight_bits}-Bit Weights)", fontweight='bold')
+    ax1.set_title(f"1. Integer LMS Weight Convergence ({base_cfg.weight_bits}-Bit Accumulators)", fontweight='bold')
     ax1.grid(True, linestyle=':', alpha=0.6)
     ax1.legend(loc='upper right', fontsize=8)
 
@@ -514,22 +538,65 @@ def run_design_space_exploration():
     ax2.grid(True, linestyle=':', alpha=0.6)
     ax2.legend()
 
-    # Panel 3: SNDR vs Unified Register Width (B_reg)
-    ax3.plot(reg_bits_range, sndr_vs_reg_bits, 'o-', color='tab:purple', lw=2)
-    ax3.set_xlabel("Datapath Wordlength B_reg (Bits)", fontsize=10)
+    # Panel 3: Performance vs. Number of Calibrated Stages
+    ax3.plot(cal_stage_range, sndr_vs_stages, 'o-', color='tab:purple', lw=2)
+    ax3.set_xlabel("Number of Calibrated Stages (Front-to-Back)", fontsize=10)
     ax3.set_ylabel("Calibrated Dynamic SNDR (dB)", fontsize=10)
-    ax3.set_title("3. Performance vs. Hardware Register Bitwidth", fontweight='bold')
+    ax3.set_title("3. Performance vs. Calibrated Stage Count", fontweight='bold')
     ax3.grid(True, linestyle=':', alpha=0.6)
 
-    # Panel 4: SNDR vs LMS Step Size Shift (mu_shift = 2^-S)
-    ax4.plot(mu_shifts_range, sndr_vs_mu_shift, 's-', color='tab:green', lw=2)
-    ax4.set_xlabel("LMS Shift Parameter (mu = 2^-S)", fontsize=10)
+    # Panel 4: Performance vs. Calibration Cycles per Stage
+    ax4.plot(cycles_range, sndr_vs_cycles, 's-', color='tab:green', lw=2)
+    ax4.set_xlabel("Calibration Clock Cycles per Stage", fontsize=10)
     ax4.set_ylabel("Calibrated Dynamic SNDR (dB)", fontsize=10)
-    ax4.set_title("4. Performance vs. Hardware Step Size (mu_shift)", fontweight='bold')
+    ax4.set_title("4. Calibration Quality vs. Loop Cycles", fontweight='bold')
     ax4.grid(True, linestyle=':', alpha=0.6)
 
-    plt.suptitle(f"calADC Integer Arithmetic Hardware Study (2.5V Process, {base_cfg.total_bits}-Bit Nominal)", fontsize=13, fontweight='bold')
-    plt.tight_layout()
+    fig1.suptitle(f"calADC Digital Calibration System Dashboard ({base_cfg.total_bits}-Bit Nominal Pipeline)", fontsize=13, fontweight='bold')
+    fig1.tight_layout()
+    plt.show()
+
+    # ==========================================================================
+    # FIGURE 2: HARDWARE WORDLENGTH & STATIC NON-LINEARITY DASHBOARD
+    # ==========================================================================
+    fig2, ((ax2_1, ax2_2), (ax2_3, ax2_4)) = plt.subplots(2, 2, figsize=(13, 9.5))
+
+    # Panel 1: SNDR vs Datapath Register Wordlength (B_reg)
+    ax2_1.plot(reg_bits_range, sndr_vs_reg_bits, 'o-', color='tab:indigo', lw=2)
+    ax2_1.set_xlabel("Hardware Register Bitwidth B_reg (Bits)", fontsize=10)
+    ax2_1.set_ylabel("Calibrated Dynamic SNDR (dB)", fontsize=10)
+    ax2_1.set_title("1. Performance vs. Hardware Register Wordlength", fontweight='bold')
+    ax2_1.grid(True, linestyle=':', alpha=0.6)
+
+    # Panel 2: SNDR vs LMS Hardware Shift (mu_shift = 2^-S)
+    ax2_2.plot(mu_shifts_range, sndr_vs_mu_shift, 's-', color='tab:olive', lw=2)
+    ax2_2.set_xlabel("LMS Shift Parameter S (mu = 2^-S)", fontsize=10)
+    ax2_2.set_ylabel("Calibrated Dynamic SNDR (dB)", fontsize=10)
+    ax2_2.set_title("2. Performance vs. Hardware Step Size (mu_shift)", fontweight='bold')
+    ax2_2.grid(True, linestyle=':', alpha=0.6)
+
+    # Panel 3: Static DNL Comparison
+    ax2_3.plot(code_axis_u, dnl_u, color='tab:red', alpha=0.6, lw=0.8, label=f'Uncal (Max={np.max(np.abs(dnl_u)):.2f} LSB)')
+    ax2_3.plot(code_axis_c, dnl_cal, color='tab:blue', lw=1.0, label=f'Cal (Max={np.max(np.abs(dnl_cal)):.2f} LSB)')
+    ax2_3.axhline(0.5, color='black', linestyle=':', lw=0.8)
+    ax2_3.axhline(-0.5, color='black', linestyle=':', lw=0.8)
+    ax2_3.set_xlabel("Digital Output Code", fontsize=10)
+    ax2_3.set_ylabel("DNL (LSB)", fontsize=10)
+    ax2_3.set_title("3. Differential Non-Linearity (DNL)", fontweight='bold')
+    ax2_3.grid(True, linestyle=':', alpha=0.6)
+    ax2_3.legend(loc='upper right', fontsize=8)
+
+    # Panel 4: Static INL Comparison
+    ax2_4.plot(code_axis_u, inl_u, color='tab:red', alpha=0.7, lw=1.0, label=f'Uncal (Max={np.max(np.abs(inl_u)):.2f} LSB)')
+    ax2_4.plot(code_axis_c, inl_cal, color='tab:blue', lw=1.5, label=f'Cal (Max={np.max(np.abs(inl_cal)):.2f} LSB)')
+    ax2_4.set_xlabel("Digital Output Code", fontsize=10)
+    ax2_4.set_ylabel("INL (LSB)", fontsize=10)
+    ax2_4.set_title("4. Integral Non-Linearity (INL)", fontweight='bold')
+    ax2_4.grid(True, linestyle=':', alpha=0.6)
+    ax2_4.legend(loc='upper right', fontsize=8)
+
+    fig2.suptitle(f"calADC Integer Hardware & Static Analysis ({base_cfg.total_bits}-Bit Nominal Pipeline)", fontsize=13, fontweight='bold')
+    fig2.tight_layout()
     plt.show()
 
 
