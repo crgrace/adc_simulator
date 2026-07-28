@@ -27,7 +27,8 @@ def run_sanity_check(cfg: ADCConfig):
     M_bin = 31
     t = np.arange(num_samples)
     f_in = M_bin / num_samples
-    vin_sine = cfg.Vcm_in + (0.48 * cfg.Vref) * np.sin(2 * np.pi * f_in * t)
+    # 0.96 * Vref near full-scale differential swing (-0.35 dBFS)
+    vin_sine = cfg.Vcm_in + (0.96 * cfg.Vref) * np.sin(2 * np.pi * f_in * t)
 
     recon_sine = adc.run_transient_simulation(vin_sine, Vcm_in=cfg.Vcm_in)
     sndr, sfdr, enob, spectrum_db = adc.compute_coherent_fft_metrics(recon_sine, M_bin)
@@ -95,7 +96,7 @@ def run_gamma_sweep(base_cfg: ADCConfig, gamma_range=np.linspace(0.67, 2.5, 10))
 # ==============================================================================
 # EXPERIMENT 3: VREF NOISE SWEEP
 # ==============================================================================
-def run_vref_noise_sweep(base_cfg: ADCConfig, max_vref_noise_mv=2.0, num_points=20):
+def run_vref_noise_sweep(base_cfg: ADCConfig, max_vref_noise_mv=3.0, num_points=20):
     print("\n" + "="*70)
     print(f" EXPERIMENT 3: VREF NOISE SWEEP (0 to {max_vref_noise_mv:.2f} mV RMS)")
     print("="*70)
@@ -106,7 +107,7 @@ def run_vref_noise_sweep(base_cfg: ADCConfig, max_vref_noise_mv=2.0, num_points=
     M_bin = 31
     t = np.arange(num_samples)
     f_in = M_bin / num_samples
-    vin_sine = base_cfg.Vcm_in + (0.48 * base_cfg.Vref) * np.sin(2 * np.pi * f_in * t)
+    vin_sine = base_cfg.Vcm_in + (0.96 * base_cfg.Vref) * np.sin(2 * np.pi * f_in * t)
 
     sndr_list = []
     for vnoise in vref_noise_range:
@@ -133,13 +134,13 @@ def run_vref_noise_sweep(base_cfg: ADCConfig, max_vref_noise_mv=2.0, num_points=
 def run_capacitance_vs_vref_sweep(
     base_cfg: ADCConfig, 
     target_snr_db=70.0, 
-    vref_pp_range=np.linspace(0.5, 4.0, 20)
+    vref_pp_range=np.linspace(0.8, 4.0, 20)
 ):
     print("\n" + "="*70)
     print(f" EXPERIMENT 4: CONSTANT SNR ({target_snr_db} dB) VREF SWEEP")
     print("="*70)
 
-    default_taper = [1.0, 0.6, 0.4, 0.25, 0.15, 0.1, 0.1, 0.1]
+    default_taper = [1.0, 0.6, 0.4, 0.3, 0.2, 0.2, 0.2, 0.2]
     if len(default_taper) >= base_cfg.num_stages:
         taper_profile = default_taper[:base_cfg.num_stages]
     else:
@@ -149,11 +150,11 @@ def run_capacitance_vs_vref_sweep(
 
     for vref_pp in vref_pp_range:
         vref_peak = vref_pp / 2.0
-        Cs_base = 1.0e-12
+        Cs_base = 0.5e-12
 
         test_cfg = replace(
-            base_cfg, Vref=vref_peak, sha_Cs=1.25*Cs_base, sha_Cf=1.25*Cs_base, sha_C_cmfb=0.15*Cs_base,
-            Cs_profile=[Cs_base*tap for tap in taper_profile], mdac_C_cmfb=0.15*Cs_base
+            base_cfg, Vref=vref_peak, sha_Cs=1.0*Cs_base, sha_Cf=1.0*Cs_base, sha_C_cmfb=0.25*Cs_base,
+            Cs_profile=[Cs_base*tap for tap in taper_profile], mdac_C_cmfb=0.20*Cs_base
         )
         adc_test = FullPipelinedADCSimulator.from_config(test_cfg)
         _, summary_test = adc_test.run_static_analysis()
@@ -163,8 +164,8 @@ def run_capacitance_vs_vref_sweep(
         Cs_scaled = Cs_base * (target_snr_linear / snr_base_linear)
 
         final_cfg = replace(
-            base_cfg, Vref=vref_peak, sha_Cs=1.25*Cs_scaled, sha_Cf=1.25*Cs_scaled, sha_C_cmfb=0.15*Cs_scaled,
-            Cs_profile=[Cs_scaled*tap for tap in taper_profile], mdac_C_cmfb=0.15*Cs_scaled
+            base_cfg, Vref=vref_peak, sha_Cs=1.0*Cs_scaled, sha_Cf=1.0*Cs_scaled, sha_C_cmfb=0.25*Cs_scaled,
+            Cs_profile=[Cs_scaled*tap for tap in taper_profile], mdac_C_cmfb=0.20*Cs_scaled
         )
         adc_final = FullPipelinedADCSimulator.from_config(final_cfg)
 
@@ -175,8 +176,8 @@ def run_capacitance_vs_vref_sweep(
 
         print(f"  Vref_pp = {vref_pp:.2f} V  -->  Total Required Capacitance = {tot_pF:.2f} pF")
 
-    idx_1v = np.argmin(np.abs(vref_pp_range - 1.0))
-    theoretical_curve = total_caps_pF[idx_1v] * (1.0 / (vref_pp_range ** 2))
+    idx_ref = np.argmin(np.abs(vref_pp_range - (2.0 * base_cfg.Vref)))
+    theoretical_curve = total_caps_pF[idx_ref] * ((vref_pp_range[idx_ref] / vref_pp_range) ** 2)
 
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(13, 5))
 
@@ -203,15 +204,19 @@ def run_capacitance_vs_vref_sweep(
 # ==============================================================================
 # EXPERIMENT 5: DEDICATED STATIC DNL / INL MEASUREMENT
 # ==============================================================================
-def run_dnl_inl_experiment(base_cfg: ADCConfig, num_ramp_samples=300000):
+def run_dnl_inl_experiment(base_cfg: ADCConfig, num_ramp_samples=None):
     print("\n" + "="*70)
     print(" EXPERIMENT 5: STATIC DNL / INL MEASUREMENT")
     print("="*70)
 
-    cfg = replace(base_cfg, sigma_cap_mismatch=0.001, sigma_comp_offset=0.012, sigma_a0_db=1.0)
+    cfg = replace(base_cfg, sigma_cap_mismatch=0.0008, sigma_comp_offset=0.015, sigma_a0_db=0.8)
     adc = FullPipelinedADCSimulator.from_config(cfg)
 
-    print(f"Running linear ramp simulation with {num_ramp_samples:,} samples...")
+    # Automatically set sample count to 10 hits per LSB code: 10 * 2^total_bits
+    if num_ramp_samples is None:
+        num_ramp_samples = 10 * (2 ** adc.total_bits)
+
+    print(f"Running linear ramp simulation with {num_ramp_samples:,} samples ({adc.total_bits}-bit resolution, 10 hits/code)...")
     codes, dnl, inl = adc.run_ramp_dnl_inl(num_ramp_samples=num_ramp_samples, Vcm_in=cfg.Vcm_in)
 
     max_dnl = np.max(np.abs(dnl))
@@ -245,76 +250,24 @@ def run_dnl_inl_experiment(base_cfg: ADCConfig, num_ramp_samples=300000):
 
 
 # ==============================================================================
-# EXPERIMENT 6: COMPREHENSIVE GM/ID TRADE-OFF ANALYSIS
-# (1. Max Speed at Fixed Power | 2. Min Power at Fixed Speed | 3. Walden FOM)
+# EXPERIMENT 6: GM/ID TRADE-OFF SWEEP (POWER, SPEED, GATE AREA, THERMAL SNR)
 # ==============================================================================
-def run_gm_over_id_sweep(
-    base_cfg: ADCConfig, 
-    gm_id_range=np.linspace(6.0, 20.0, 25)
-):
+def run_gm_over_id_comprehensive_sweep(base_cfg: ADCConfig, gm_id_range=np.linspace(6.0, 20.0, 25), L_nm=280):
     print("\n" + "="*70)
-    print(" EXPERIMENT 6: GM/ID TRADE-OFF ANALYSIS")
+    print(" EXPERIMENT 6: GM/ID COMPREHENSIVE DESIGN SWEEP")
     print("="*70)
 
-    # --------------------------------------------------------------------------
-    # PART A: FIXED CLOCK SPEED (f_clk = 100 MHz) -> Power & Walden FOM
-    # --------------------------------------------------------------------------
-    power_fixed_fclk_mW = []
-    fom_walden_fJ = []
-    enob_list = []
+    power_mW = []
+    thermal_snr_dB = []
+    area_gate_relative = []
+    f_max_fixed_gm_MHz = []
 
-    for gm_id in gm_id_range:
-        # Parasitic cap scales quadratically in weak/subthreshold inversion
-        cp_scale = (gm_id / base_cfg.gm_over_id) ** 2
-        
-        cfg = replace(
-            base_cfg,
-            gm_over_id=gm_id,
-            sha_Cp=base_cfg.sha_Cp * cp_scale,
-            mdac_Cp=base_cfg.mdac_Cp * cp_scale
-        )
-        adc = FullPipelinedADCSimulator.from_config(cfg)
-
-        # Static power and thermal ENOB for target f_clk
-        _, summary = adc.run_static_analysis(f_clk=cfg.f_clk, t_non_overlap=cfg.t_non_overlap)
-        p_mW = float(summary["Total OTA Power"].split()[0])
-        enob = float(summary["Thermal ENOB"].split()[0])
-
-        # Walden FOM in fJ/conv-step: P / (2^ENOB * f_clk)
-        p_watts = p_mW * 1e-3
-        fom_fJ = (p_watts / ((2 ** enob) * cfg.f_clk)) * 1e15
-
-        power_fixed_fclk_mW.append(p_mW)
-        enob_list.append(enob)
-        fom_walden_fJ.append(fom_fJ)
-
-    # Find optimal Walden FOM sweet spot
-    opt_idx = np.argmin(fom_walden_fJ)
-    opt_gm_id = gm_id_range[opt_idx]
-    opt_fom = fom_walden_fJ[opt_idx]
-
-    # --------------------------------------------------------------------------
-    # PART B: FIXED POWER (Fixed Tail Current) -> Max Sampling Frequency
-    # --------------------------------------------------------------------------
-    # Establish baseline tail currents at base_cfg.gm_over_id
     adc_base = FullPipelinedADCSimulator.from_config(base_cfg)
-    sha_base_specs = adc_base.sha.calculate_settling_and_gm(
+    specs_sha_base = adc_base.sha.calculate_settling_and_gm(
         Cs_next_stage=adc_base.stages[0].Cs, total_adc_bits=adc_base.total_bits,
         f_clk=base_cfg.f_clk, t_non_overlap=base_cfg.t_non_overlap, Vdd=base_cfg.Vdd
     )
-    base_itail_sha = sha_base_specs["gm_mS"] * 1e-3 / adc_base.sha.gm_over_id
-
-    mdac_base_itails = []
-    for i, stage in enumerate(adc_base.stages):
-        cs_next = adc_base.stages[i+1].Cs if (i + 1 < len(adc_base.stages)) else 0.0
-        bits_rem = sum(s.effective_bits for s in adc_base.stages[i:]) + adc_base.quantizer_bits
-        specs = stage.calculate_settling_and_gm(
-            Cs_next_stage=cs_next, remaining_bits=bits_rem,
-            f_clk=base_cfg.f_clk, t_non_overlap=base_cfg.t_non_overlap, Vdd=base_cfg.Vdd
-        )
-        mdac_base_itails.append(specs["gm_mS"] * 1e-3 / stage.gm_over_id)
-
-    f_clk_max_MHz = []
+    gm_fixed = specs_sha_base["gm_mS"] * 1e-3
 
     for gm_id in gm_id_range:
         cp_scale = (gm_id / base_cfg.gm_over_id) ** 2
@@ -324,65 +277,289 @@ def run_gm_over_id_sweep(
         )
         adc = FullPipelinedADCSimulator.from_config(cfg)
 
-        # Calculate SHA settling time with fixed tail current
-        gm_sha = base_itail_sha * gm_id
-        cl_sha = adc.sha.calculate_cl_load(adc.stages[0].Cs)
-        beta_sha = adc.sha.beta
-        tau_sha = cl_sha / (2.0 * np.pi * beta_sha * gm_sha)
-        n_tau_sha = (adc.total_bits + 1.0) * np.log(2.0)
-        t_settle_sha = n_tau_sha * tau_sha
+        _, summary = adc.run_static_analysis(f_clk=cfg.f_clk, t_non_overlap=cfg.t_non_overlap)
+        p_val = float(summary["Total OTA Power"].split()[0])
+        snr_val = float(summary["Thermal SNR"].split()[0])
+        power_mW.append(p_val)
+        thermal_snr_dB.append(snr_val)
 
-        # Calculate MDAC settling times with fixed tail currents
-        t_settle_mdacs = []
-        for i, stage in enumerate(adc.stages):
-            cs_next = adc.stages[i+1].Cs if (i + 1 < len(adc.stages)) else 0.0
-            bits_rem = sum(s.effective_bits for s in adc.stages[i:]) + adc.quantizer_bits
-            gm_stage = mdac_base_itails[i] * gm_id
-            cl_stage = stage.calculate_cl_load(cs_next)
-            beta_stage = stage.beta
-            tau_stage = cl_stage / (2.0 * np.pi * beta_stage * gm_stage)
-            n_tau_stage = (bits_rem + 1.0) * np.log(2.0)
-            t_settle_mdacs.append(n_tau_stage * tau_stage)
+        tot_cp_fF = (adc.sha.Cp + sum(s.Cp for s in adc.stages)) * 1e15
+        area_gate_relative.append(tot_cp_fF * (L_nm / 1000.0))
 
-        # Bottleneck stage defines maximum clock frequency
-        t_settle_max = max(t_settle_sha, max(t_settle_mdacs))
-        t_clk_min = 2.0 * (t_settle_max + cfg.t_non_overlap)
-        f_max = 1.0 / t_clk_min
-        f_clk_max_MHz.append(f_max / 1e6)
+        cp_fixed_gm = base_cfg.sha_Cp * (gm_id / base_cfg.gm_over_id)
+        beta_fixed_gm = base_cfg.sha_Cf / (base_cfg.sha_Cs + base_cfg.sha_Cf + cp_fixed_gm)
+        c_series = (base_cfg.sha_Cf * (base_cfg.sha_Cs + cp_fixed_gm)) / (base_cfg.sha_Cs + base_cfg.sha_Cf + cp_fixed_gm)
+        cl_fixed_gm = adc_base.stages[0].Cs + base_cfg.sha_C_out_par + base_cfg.sha_C_cmfb + c_series
+        
+        f_cl = (beta_fixed_gm * gm_fixed) / (2.0 * np.pi * cl_fixed_gm)
+        tau = 1.0 / (2.0 * np.pi * f_cl)
+        t_settle = (adc_base.total_bits + 1.0) * np.log(2.0) * tau
+        f_max = 1.0 / (2.0 * (t_settle + base_cfg.t_non_overlap)) / 1e6
+        f_max_fixed_gm_MHz.append(f_max)
 
-        print(f"  gm/ID = {gm_id:>5.1f} V^-1  |  Power = {power_fixed_fclk_mW[len(f_clk_max_MHz)-1]:>5.2f} mW  |  Max f_clk = {f_max/1e6:>6.1f} MHz  |  FOM = {fom_walden_fJ[len(f_clk_max_MHz)-1]:>6.1f} fJ/step")
+        print(f"  gm/ID = {gm_id:>5.1f} V^-1  |  Power = {p_val:>5.2f} mW  |  Thermal SNR = {snr_val:>5.2f} dB  |  f_max = {f_max:>6.1f} MHz")
 
-    print(f"\n  ---> Walden FOM Sweet Spot: {opt_fom:.1f} fJ/conv-step at gm/ID = {opt_gm_id:.1f} V^-1")
+    fig, ((ax1, ax2), (ax3, ax4)) = plt.subplots(2, 2, figsize=(12, 9))
 
-    # --------------------------------------------------------------------------
-    # PLOTTING THE THREE TRADEOFFS
-    # --------------------------------------------------------------------------
-    fig, (ax1, ax2, ax3) = plt.subplots(1, 3, figsize=(16, 4.8))
-
-    # Panel 1: Max Speed at Fixed Power
-    ax1.plot(gm_id_range, f_clk_max_MHz, 'o-', color='tab:red', lw=2)
-    ax1.set_title("1. Max Clock Speed (Fixed Power)", fontsize=11, fontweight='bold')
-    ax1.set_xlabel("gm/ID Efficiency (V^-1)", fontsize=10)
-    ax1.set_ylabel("Max Clock Frequency f_clk_max (MHz)", fontsize=10)
+    ax1.plot(gm_id_range, power_mW, 'o-', color='tab:orange', lw=2)
+    ax1.set_xlabel("gm/ID Efficiency (V^-1)")
+    ax1.set_ylabel("Total OTA Power (mW)")
+    ax1.set_title("1. Total Power Consumption", fontweight='bold')
     ax1.grid(True, linestyle=':', alpha=0.6)
 
-    # Panel 2: Required Power at Fixed Speed (100 MHz)
-    ax2.plot(gm_id_range, power_fixed_fclk_mW, 's-', color='tab:blue', lw=2)
-    ax2.set_title("2. Required Power (Fixed 100 MHz Clock)", fontsize=11, fontweight='bold')
-    ax2.set_xlabel("gm/ID Efficiency (V^-1)", fontsize=10)
-    ax2.set_ylabel("Total OTA Power (mW)", fontsize=10)
+    ax2.plot(gm_id_range, area_gate_relative, 's-', color='tab:green', lw=2)
+    ax2.set_xlabel("gm/ID Efficiency (V^-1)")
+    ax2.set_ylabel("Relative Gate Area (a.u.)")
+    ax2.set_title("2. Relative Transistor Active Gate Area (∝ Cp × L)", fontweight='bold')
     ax2.grid(True, linestyle=':', alpha=0.6)
 
-    # Panel 3: Walden Figure of Merit (Sweet Spot)
-    ax3.plot(gm_id_range, fom_walden_fJ, 'd-', color='tab:green', lw=2, label='Walden FOM')
-    ax3.axvline(opt_gm_id, color='crimson', linestyle='--', lw=1.2, label=f'Sweet Spot ({opt_gm_id:.1f} V^-1)')
-    ax3.set_title("3. Walden FOM Sweet Spot", fontsize=11, fontweight='bold')
-    ax3.set_xlabel("gm/ID Efficiency (V^-1)", fontsize=10)
-    ax3.set_ylabel("Walden FOM (fJ/conv-step)", fontsize=10)
+    ax3.plot(gm_id_range, f_max_fixed_gm_MHz, 'd-', color='tab:red', lw=2)
+    ax3.axhline(base_cfg.f_clk / 1e6, color='black', linestyle=':', label=f'Target Clock ({base_cfg.f_clk/1e6:.0f} MHz)')
+    ax3.set_xlabel("gm/ID Efficiency (V^-1)")
+    ax3.set_ylabel("Max Sampling Rate f_clk_max (MHz)")
+    ax3.set_title("3. Speed Ceiling at Fixed gm & Cs", fontweight='bold')
     ax3.grid(True, linestyle=':', alpha=0.6)
-    ax3.legend(loc='upper right')
+    ax3.legend()
 
-    plt.suptitle("Pipelined ADC Transconductance Efficiency (gm/ID) Trade-Off Analysis", fontsize=13, fontweight='bold')
+    ax4.plot(gm_id_range, thermal_snr_dB, '^-', color='tab:blue', lw=2)
+    ax4.set_xlabel("gm/ID Efficiency (V^-1)")
+    ax4.set_ylabel("Thermal SNR (dB)")
+    ax4.set_title("4. Thermal SNR Penalty (via Beta Degradation)", fontweight='bold')
+    ax4.grid(True, linestyle=':', alpha=0.6)
+
+    plt.suptitle("Pipelined ADC Transconductance Efficiency (gm/ID) Design Space", fontsize=13, fontweight='bold')
+    plt.tight_layout()
+    plt.show()
+
+
+# ==============================================================================
+# EXPERIMENT 7: STAGE SCALING FACTOR vs. NOISE & POWER BREAKDOWN
+# ==============================================================================
+def run_stage_scaling_experiment(base_cfg: ADCConfig, alpha_range=np.linspace(0.3, 1.0, 15)):
+    print("\n" + "="*70)
+    print(" EXPERIMENT 7: STAGE SCALING FACTOR vs. NOISE & POWER BREAKDOWN")
+    print("="*70)
+
+    snr_list = []
+    power_list = []
+
+    for alpha in alpha_range:
+        cs_profile = [base_cfg.Cs_profile[0] * (alpha ** i) for i in range(base_cfg.num_stages)]
+        cfg = replace(base_cfg, Cs_profile=cs_profile)
+        adc = FullPipelinedADCSimulator.from_config(cfg)
+        _, summary = adc.run_static_analysis(f_clk=cfg.f_clk, t_non_overlap=cfg.t_non_overlap)
+        
+        snr_val = float(summary["Thermal SNR"].split()[0])
+        p_val = float(summary["Total OTA Power"].split()[0])
+        snr_list.append(snr_val)
+        power_list.append(p_val)
+        print(f"  Scaling Factor alpha = {alpha:.2f}  -->  Thermal SNR = {snr_val:.2f} dB  |  Power = {p_val:.2f} mW")
+
+    # Evaluate exact noise and power breakdown at alpha = 0.6
+    target_alpha = 0.6
+    alpha_idx = np.argmin(np.abs(alpha_range - target_alpha))
+    chosen_alpha = alpha_range[alpha_idx]
+
+    cs_profile_chosen = [base_cfg.Cs_profile[0] * (chosen_alpha ** i) for i in range(base_cfg.num_stages)]
+    cfg_chosen = replace(base_cfg, Cs_profile=cs_profile_chosen)
+    adc_chosen = FullPipelinedADCSimulator.from_config(cfg_chosen)
+
+    df_chosen, _ = adc_chosen.run_static_analysis(f_clk=cfg_chosen.f_clk, t_non_overlap=cfg_chosen.t_non_overlap)
+
+    raw_noise_sq = []
+    sha_noise_sq = adc_chosen.sha.input_referred_noise_sq
+    raw_noise_sq.append(sha_noise_sq)
+
+    cumulative_gain = adc_chosen.sha.actual_gain
+    for i, stage in enumerate(adc_chosen.stages):
+        stage_noise_sq = stage.input_referred_noise_sq / (cumulative_gain ** 2)
+        raw_noise_sq.append(stage_noise_sq)
+        cumulative_gain *= stage.actual_gain
+
+    # Group stages >= 5 into "MDAC 5+" slice
+    grouped_noise_sq = []
+    labels = []
+    for idx in range(min(5, len(raw_noise_sq))):
+        grouped_noise_sq.append(raw_noise_sq[idx])
+        labels.append("SHA" if idx == 0 else f"MDAC {idx}")
+
+    if len(raw_noise_sq) > 5:
+        grouped_noise_sq.append(sum(raw_noise_sq[5:]))
+        labels.append("MDAC 5+")
+
+    total_noise_sq = sum(grouped_noise_sq)
+    pct_noise = [(n_sq / total_noise_sq) * 100.0 for n_sq in grouped_noise_sq]
+
+    # CHART 1: SNR and Power vs Stage Scaling Factor
+    fig1, ax1 = plt.subplots(figsize=(7.5, 4.8))
+    color1 = 'tab:blue'
+    ax1.set_xlabel("Stage Scaling Factor (α)", fontsize=11)
+    ax1.set_ylabel("Thermal SNR (dB)", color=color1, fontsize=11)
+    ax1.plot(alpha_range, snr_list, 'o-', color=color1, lw=2, label='SNR (dB)')
+    ax1.tick_params(axis='y', labelcolor=color1)
+    ax1.grid(True, linestyle=':', alpha=0.6)
+
+    ax1_twin = ax1.twinx()
+    color2 = 'tab:orange'
+    ax1_twin.set_ylabel("Total OTA Power (mW)", color=color2, fontsize=11)
+    ax1_twin.plot(alpha_range, power_list, 's--', color=color2, lw=2, label='Power (mW)')
+    ax1_twin.tick_params(axis='y', labelcolor=color2)
+    ax1.set_title("Thermal SNR & Power vs. Stage Scaling Factor (α)", fontsize=11, fontweight='bold')
+    plt.tight_layout()
+    plt.show()
+
+    # CHART 2: Standalone Pie Chart for Grouped Noise Breakdown
+    fig2, ax2 = plt.subplots(figsize=(6.5, 5.5))
+    explode = [0.08] + [0.0] * (len(labels) - 1)
+    colors = plt.cm.Blues(np.linspace(0.85, 0.35, len(labels)))
+
+    wedges, texts, autotexts = ax2.pie(
+        pct_noise, labels=labels, autopct='%1.1f%%', startangle=140,
+        explode=explode, colors=colors, textprops=dict(color="black")
+    )
+    plt.setp(autotexts, size=9, weight="bold")
+    ax2.set_title(f"Input-Referred Thermal Noise Contribution\n(at Stage Scaling α = {chosen_alpha:.2f})", fontsize=12, fontweight='bold')
+    plt.tight_layout()
+    plt.show()
+
+    # CHART 3: Power Allocation Bar Chart per Stage (Grouped MDAC 5+)
+    fig3, ax3 = plt.subplots(figsize=(7.5, 4.8))
+    raw_powers = [r["OTA Power (mW)"] for r in df_chosen.to_dict('records')]
+    grouped_powers = raw_powers[:5] + [sum(raw_powers[5:])]
+
+    bars = ax3.bar(labels, grouped_powers, color='tab:orange', width=0.55, edgecolor='black', linewidth=0.8)
+    ax3.set_ylabel("OTA Power Consumption (mW)", fontsize=11)
+    ax3.set_title(f"Stage-by-Stage Power Allocation\n(at Stage Scaling α = {chosen_alpha:.2f})", fontsize=12, fontweight='bold')
+    ax3.grid(True, linestyle=':', alpha=0.6, axis='y')
+
+    tot_p = sum(grouped_powers)
+    for bar in bars:
+        height = bar.get_height()
+        pct = (height / tot_p) * 100.0
+        ax3.annotate(f"{height:.2f} mW\n({pct:.1f}%)",
+                     xy=(bar.get_x() + bar.get_width() / 2, height),
+                     xytext=(0, 3), textcoords="offset points",
+                     ha='center', va='bottom', fontsize=9, fontweight='bold')
+
+    plt.tight_layout()
+    plt.show()
+
+
+# ==============================================================================
+# EXPERIMENT 8: COMPARATOR OFFSET REDUNDANCY TOLERANCE SWEEP
+# ==============================================================================
+def run_comparator_offset_tolerance_experiment(base_cfg: ADCConfig, max_offset_mv=350.0, num_points=20):
+    print("\n" + "="*70)
+    print(" EXPERIMENT 8: COMPARATOR OFFSET REDUNDANCY TOLERANCE SWEEP")
+    print("="*70)
+
+    offsets_mv = np.linspace(0.0, max_offset_mv, num_points)
+    num_samples = 2048
+    M_bin = 31
+    t = np.arange(num_samples)
+    f_in = M_bin / num_samples
+    vin_sine = base_cfg.Vcm_in + (0.96 * base_cfg.Vref) * np.sin(2 * np.pi * f_in * t)
+
+    enob_list = []
+    for offset_mv in offsets_mv:
+        cfg = replace(base_cfg, sigma_comp_offset=offset_mv / 1000.0)
+        adc = FullPipelinedADCSimulator.from_config(cfg)
+        recon = adc.run_transient_simulation(vin_sine, Vcm_in=cfg.Vcm_in)
+        _, _, enob, _ = adc.compute_coherent_fft_metrics(recon, M_bin)
+        enob_list.append(enob)
+        print(f"  Comp Offset Std Dev = {offset_mv:>5.1f} mV  -->  Dynamic ENOB = {enob:.2f} bits")
+
+    plt.figure(figsize=(7.5, 4.5))
+    plt.plot(offsets_mv, enob_list, 's-', color='tab:red', lw=2)
+    plt.axvline(base_cfg.Vref * 1e3 / 4.0, color='black', linestyle='--', label='Theoretical RSD Bound (Vref/4)')
+    plt.title("Dynamic ENOB vs. Sub-ADC Comparator Offset (RSD Margin Test)", fontsize=11, fontweight='bold')
+    plt.xlabel("Comparator Offset Std Dev (mV RMS)", fontsize=10)
+    plt.ylabel("Dynamic ENOB (Bits)", fontsize=10)
+    plt.grid(True, linestyle=':', alpha=0.6)
+    plt.legend()
+    plt.tight_layout()
+    plt.show()
+
+
+# ==============================================================================
+# EXPERIMENT 9: ISOLATED OTA DC OPEN-LOOP GAIN (A0) REQUIREMENT SWEEP
+# ==============================================================================
+def run_ota_gain_requirement_sweep(base_cfg: ADCConfig, a0_db_range=np.linspace(35, 85, 20)):
+    print("\n" + "="*70)
+    print(" EXPERIMENT 9: OTA DC OPEN-LOOP GAIN (A0) REQUIREMENT SWEEP")
+    print("="*70)
+
+    num_samples = 2048
+    M_bin = 31
+    t = np.arange(num_samples)
+    f_in = M_bin / num_samples
+    vin_sine = base_cfg.Vcm_in + (0.96 * base_cfg.Vref) * np.sin(2 * np.pi * f_in * t)
+
+    sndr_list = []
+    for a0_db in a0_db_range:
+        # Zero out reference noise and cap mismatch to isolate pure A0 gain error ceiling
+        cfg = replace(
+            base_cfg, 
+            sha_A0_db=a0_db + 10.0, 
+            mdac_A0_db=a0_db, 
+            sigma_a0_db=0.0,
+            sigma_vref_noise=0.0,
+            sigma_cap_mismatch=0.0
+        )
+        adc = FullPipelinedADCSimulator.from_config(cfg)
+        recon = adc.run_transient_simulation(vin_sine, Vcm_in=cfg.Vcm_in)
+        sndr, _, enob, _ = adc.compute_coherent_fft_metrics(recon, M_bin)
+        sndr_list.append(sndr)
+        print(f"  MDAC OTA Gain A0 = {a0_db:>4.1f} dB  -->  Dynamic SNDR = {sndr:.2f} dB  |  ENOB = {enob:.2f} bits")
+
+    plt.figure(figsize=(7.5, 4.5))
+    plt.plot(a0_db_range, sndr_list, 'd-', color='tab:purple', lw=2)
+    plt.axhline(61.9, color='crimson', linestyle='--', label='10-Bit Ideal (61.9 dB)')
+    plt.title("Isolated Dynamic SNDR vs. MDAC OTA DC Open-Loop Gain (A0)", fontsize=11, fontweight='bold')
+    plt.xlabel("MDAC OTA Open-Loop DC Gain A0 (dB)", fontsize=10)
+    plt.ylabel("Dynamic SNDR (dB)", fontsize=10)
+    plt.grid(True, linestyle=':', alpha=0.6)
+    plt.legend()
+    plt.tight_layout()
+    plt.show()
+
+
+# ==============================================================================
+# EXPERIMENT 10: SAMPLING FREQUENCY (f_clk) SETTLING WALL SWEEP
+# ==============================================================================
+def run_clock_frequency_settling_sweep(base_cfg: ADCConfig, f_clk_range_mhz=np.linspace(20, 160, 25)):
+    print("\n" + "="*70)
+    print(" EXPERIMENT 10: SAMPLING FREQUENCY (f_clk) SETTLING WALL SWEEP")
+    print("="*70)
+
+    # Instantiate ADC once at fixed baseline design target (80 MHz)
+    adc = FullPipelinedADCSimulator.from_config(base_cfg)
+
+    num_samples = 2048
+    M_bin = 31
+    t = np.arange(num_samples)
+    f_in = M_bin / num_samples
+    vin_sine = base_cfg.Vcm_in + (0.96 * base_cfg.Vref) * np.sin(2 * np.pi * f_in * t)
+
+    enob_list = []
+    for f_mhz in f_clk_range_mhz:
+        f_hz = f_mhz * 1e6
+        recon = adc.run_transient_simulation(
+            vin_sine, Vcm_in=base_cfg.Vcm_in, 
+            f_clk=f_hz, t_non_overlap=base_cfg.t_non_overlap
+        )
+        _, _, enob, _ = adc.compute_coherent_fft_metrics(recon, M_bin)
+        enob_list.append(enob)
+        print(f"  f_clk = {f_mhz:>5.1f} MHz  -->  Dynamic ENOB = {enob:.2f} bits")
+
+    plt.figure(figsize=(7.5, 4.5))
+    plt.plot(f_clk_range_mhz, enob_list, '^-', color='tab:green', lw=2)
+    plt.axvline(base_cfg.f_clk / 1e6, color='black', linestyle='--', label=f'Design Target ({base_cfg.f_clk/1e6:.0f} MHz)')
+    plt.title("Effective Resolution (ENOB) vs. Sampling Rate f_clk (Settling Wall)", fontsize=11, fontweight='bold')
+    plt.xlabel("Sampling Frequency f_clk (MHz)", fontsize=10)
+    plt.ylabel("Dynamic Resolution ENOB (Bits)", fontsize=10)
+    plt.grid(True, linestyle=':', alpha=0.6)
+    plt.legend()
     plt.tight_layout()
     plt.show()
 
@@ -391,115 +568,51 @@ def run_gm_over_id_sweep(
 # MAIN EXECUTION
 # ==============================================================================
 if __name__ == "__main__":
-
-    # ------------------------------------------------------------------------------
-    # CONFIG 0: 1.2V Thin-Oxide Devices (65nm Process, L = 65nm)
-    # High Speed, Larger Sampling Capacitors, Lower Reference Swing
-    # ------------------------------------------------------------------------------
     
+    # Configuration tailored for 2.5V thick-oxide devices (L = 280nm) in 65nm CMOS
     main_config = ADCConfig(
-        num_stages=8,               # 8 MDAC stages (10 bits resolution total)
-        Vref=1.0,
-        Vdd=1.2,
-        gm_over_id=12.0,            # Default gm/ID efficiency (12 V^-1)
-        temp_celsius=27.0,
-        gamma_transistor=1.5,
+        num_stages=8,               # 8 MDAC stages (10 bits total resolution)
+        Vdd=2.5,                    # 2.5V I/O Supply Voltage
+        Vref=1.2,                   # Peak reference voltage (2.4V peak-to-peak differential)
+        Vcm_in=1.25,                # Mid-supply common mode
+        f_clk=80e6,                 # Target clock frequency (80 MHz for 2.5V devices)
+        t_non_overlap=0.5e-9,       # Clock non-overlap time
         
-        # SHA parameters
-        sha_A0_db=75.0,
-        sha_Cs=2.5e-12,
-        sha_C_cmfb=0.25e-12,
+        # Transistor specs for 2.5V thick-oxide (L = 280nm)
+        gm_over_id=12.0,            # Transconductance efficiency (V^-1)
+        gamma_transistor=1.1,       # Noise factor (lower due to less velocity saturation)
         
-        # MDAC parameters
-        mdac_A0_db=65.0,
-        mdac_C_cmfb=0.15e-12,
-        Cs_profile=[2.0e-12, 1.2e-12, 0.8e-12, 0.5e-12, 0.3e-12, 0.2e-12, 0.2e-12, 0.2e-12],
+        # Front-End SHA Parameters
+        sha_Cs=0.6e-12,             # 0.6 pF (smaller Cs required thanks to 2.4Vpp swing)
+        sha_Cf=0.6e-12,
+        sha_Cp=0.40e-12,            # Higher parasitic cap (~4x higher than 1.2V core due to L=280nm)
+        sha_C_out_par=0.15e-12,
+        sha_C_cmfb=0.15e-12,
+        sha_A0_db=75.0,             # Higher intrinsic gain easily achieved
+        
+        # MDAC Stage Parameters (scaled down due to 2.4Vpp swing)
+        Cs_profile=[0.5e-12, 0.3e-12, 0.2e-12, 0.15e-12, 0.1e-12, 0.1e-12, 0.1e-12, 0.1e-12],
+        mdac_Cp=0.30e-12,           # MDAC parasitic cap
+        mdac_C_out_par=0.10e-12,
+        mdac_C_cmfb=0.10e-12,
+        mdac_A0_db=68.0,
         
         # Non-idealities & Mismatch Parameters
-        sigma_cap_mismatch=0.001,   # 0.1% C mismatch
-        sigma_comp_offset=0.012,    # 12 mV comparator offset
-        sigma_vref_noise=0.0005,    # 0.5 mV Vref noise
-        sigma_a0_db=1.0             # 1.0 dB OTA open-loop gain mismatch
-    )
-    
-    # ------------------------------------------------------------------------------
-    # CONFIG 1: 1.2V Thin-Oxide Devices (65nm Process, L = 65nm)
-    # High Speed, Larger Sampling Capacitors, Lower Reference Swing
-    # ------------------------------------------------------------------------------
-    process_65nm_1v2_config = ADCConfig(
-        num_stages=8,               # 8 MDAC stages (10 bits total)
-        Vdd=1.2,                    # 1.2V Core Supply
-        Vref=0.5,                   # 1.0V Peak-to-Peak Differential Swing
-        Vcm_in=0.6,                 # Mid-supply common mode (0.6V)
-        f_clk=150e6,                # High sampling rate (150 MHz target)
-        t_non_overlap=0.3e-9,       # Faster clock transitions
-    
-        # Transistor technology specs (Thin-oxide short-channel)
-        gm_over_id=12.0,
-        # Higher noise factor due to hot carriers / velocity saturation
-        gamma_transistor=1.6,
-    
-        # Capacitors (Larger Cs required to offset smaller 1.0Vpp signal swing)
-        sha_Cs=2.5e-12,             # 2.5 pF required for ~70 dB SNR
-        sha_Cf=2.5e-12,
-        sha_Cp=0.10e-12,            # Small parasitic cap (small L = 65nm)
-        sha_C_cmfb=0.20e-12,
-        sha_A0_db=70.0,             # Harder to get high gain in short channel
-    
-        # MDAC stage caps (scaled up for thermal noise)
-        Cs_profile=[2.0e-12, 1.2e-12, 0.8e-12, 0.5e-12,
-                    0.3e-12, 0.2e-12, 0.2e-12, 0.2e-12],
-        mdac_Cp=0.10e-12,           # Low parasitic cap
-        mdac_C_cmfb=0.15e-12,
-        mdac_A0_db=62.0,            # 62 dB gain
-    
-        # Non-idealities & Mismatch
-        sigma_cap_mismatch=0.0010,  # 0.1% C mismatch
-        sigma_comp_offset=0.012,    # 12 mV comparator offset
-        sigma_vref_noise=0.0005,    # 0.5 mV Vref noise
-        sigma_a0_db=1.0
-    )
-    
-    # ------------------------------------------------------------------------------
-    # CONFIG 2: 2.5V Thick-Oxide Devices (65nm Process, L = 280nm)
-    # Lower Speed, Small Sampling Capacitors, Large Reference Swing
-    # ------------------------------------------------------------------------------
-    process_65nm_2v5_config = ADCConfig(
-        num_stages=8,               # 8 MDAC stages (10 bits total)
-        Vdd=2.5,                    # 2.5V I/O Supply
-        Vref=1.2,                   # 2.4V Peak-to-Peak Differential Swing
-        Vcm_in=1.25,                # Mid-supply common mode (1.25V)
-        f_clk=80e6,                 # Lower sampling rate limit (80 MHz target)
-        t_non_overlap=0.5e-9,       
-        
-        # Transistor technology specs (Thick-oxide long-channel)
-        gm_over_id=12.0,            
-        gamma_transistor=1.1,       # Lower noise factor (less velocity saturation)
-        
-        # Capacitors (Much smaller Cs thanks to 2.4Vpp swing!)
-        sha_Cs=0.6e-12,             # 0.6 pF achieves same SNR as 2.5 pF at 1.2V
-        sha_Cf=0.6e-12,
-        sha_Cp=0.40e-12,            # Larger parasitic cap (~4x higher due to L = 280nm)
-        sha_C_cmfb=0.15e-12,
-        sha_A0_db=75.0,             # High open-loop gain easily achieved
-        
-        # MDAC stage caps (scaled down)
-        Cs_profile=[0.5e-12, 0.3e-12, 0.2e-12, 0.15e-12, 0.1e-12, 0.1e-12, 0.1e-12, 0.1e-12],
-        mdac_Cp=0.30e-12,           # Higher parasitic cap
-        mdac_C_cmfb=0.10e-12,
-        mdac_A0_db=68.0,            # 68 dB gain
-        
-        # Non-idealities & Mismatch
-        sigma_cap_mismatch=0.0008,  # Slightly better matching at 2.5V
+        sigma_cap_mismatch=0.0008,  # Better capacitor matching at 2.5V
         sigma_comp_offset=0.015,    # 15 mV comparator offset
         sigma_vref_noise=0.0008,    # 0.8 mV Vref noise
-        sigma_a0_db=0.8
-    )    
+        sigma_a0_db=0.8             # Open-loop gain mismatch
+    )
 
+    # Execute all design space exploration experiments
     run_sanity_check(main_config)
     run_temperature_sweep(main_config)
     run_gamma_sweep(main_config)
-    run_vref_noise_sweep(main_config, max_vref_noise_mv=2.0, num_points=20)
+    run_vref_noise_sweep(main_config, max_vref_noise_mv=3.0, num_points=20)
     run_capacitance_vs_vref_sweep(main_config)
-    run_dnl_inl_experiment(main_config,num_ramp_samples=100*pow((main_config.num_stages+2),2))
-    run_gm_over_id_sweep(main_config)
+    run_dnl_inl_experiment(main_config)
+    run_gm_over_id_comprehensive_sweep(main_config, L_nm=280)
+    run_stage_scaling_experiment(main_config)
+    run_comparator_offset_tolerance_experiment(main_config)
+    run_ota_gain_requirement_sweep(main_config)
+    run_clock_frequency_settling_sweep(main_config)

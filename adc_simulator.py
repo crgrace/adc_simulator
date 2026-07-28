@@ -86,6 +86,10 @@ class ConventionalSHA:
         self.gm_over_id = gm_over_id
         self.gamma_transistor = gamma_transistor
         self.temp_kelvin = celsius_to_kelvin(temp_celsius)
+        
+        # Fixed physical sizing attributes
+        self.gm = None
+        self.tau = None
 
     @property
     def beta(self):
@@ -128,11 +132,17 @@ class ConventionalSHA:
             "Power_mW": P_ota * 1e3
         }
 
-    def process_signal(self, Vin_se, Vcm_in=0.5):
-        # Inject input-referred thermal noise sample
+    def process_signal(self, Vin_se, Vcm_in=0.5, t_settle=None):
+        settling_factor = 1.0
+        if t_settle is not None and self.tau is not None:
+            if t_settle <= 0:
+                settling_factor = 0.0
+            else:
+                settling_factor = max(0.0, 1.0 - np.exp(-t_settle / self.tau))
+
         v_noise = np.random.normal(0, np.sqrt(self.input_referred_noise_sq))
         Vin_diff = (Vin_se - Vcm_in) + v_noise
-        return Vin_diff * self.actual_gain
+        return Vin_diff * self.actual_gain * settling_factor
 
 
 # ==============================================================================
@@ -168,6 +178,10 @@ class NonIdealMDACStage:
         vth_nom = Vref / 4.0
         self.vth_hi = vth_nom + np.random.normal(0, sigma_comp_offset)
         self.vth_lo = -vth_nom + np.random.normal(0, sigma_comp_offset)
+
+        # Fixed physical sizing attributes
+        self.gm = None
+        self.tau = None
 
     @property
     def beta(self):
@@ -213,10 +227,15 @@ class NonIdealMDACStage:
             "Power_mW": P_ota * 1e3
         }
 
-    def process_sample(self, Vin):
-        vref_sample = self.Vref + np.random.normal(0, self.sigma_vref_noise)
+    def process_sample(self, Vin, t_settle=None):
+        settling_factor = 1.0
+        if t_settle is not None and self.tau is not None:
+            if t_settle <= 0:
+                settling_factor = 0.0
+            else:
+                settling_factor = max(0.0, 1.0 - np.exp(-t_settle / self.tau))
 
-        # Inject stage input-referred thermal noise sample
+        vref_sample = self.Vref + np.random.normal(0, self.sigma_vref_noise)
         v_noise = np.random.normal(0, np.sqrt(self.input_referred_noise_sq))
         Vin_noisy = Vin + v_noise
 
@@ -229,11 +248,11 @@ class NonIdealMDACStage:
 
         loop_gain = self.A0 * self.beta
         gain_factor = loop_gain / (1.0 + loop_gain)
-    
+        
         G_stage = (1.0 + (self.Cs / self.Cf)) * gain_factor
         Vdac = D * (self.Cs / self.Cf) * vref_sample * gain_factor
-    
-        Vres = (Vin_noisy * G_stage) - Vdac
+        
+        Vres = ((Vin_noisy * G_stage) - Vdac) * settling_factor
         return D, Vres
 
 
@@ -251,7 +270,7 @@ class FullPipelinedADCSimulator:
 
     @classmethod
     def from_config(cls, cfg: ADCConfig):
-        """Constructs full simulator directly from an ADCConfig instance."""
+        """Constructs full simulator and fixes OTA sizing/time constants at cfg.f_clk."""
         sha_gm_id = cfg.sha_gm_over_id if cfg.sha_gm_over_id is not None else cfg.gm_over_id
 
         sha = ConventionalSHA(
@@ -261,7 +280,6 @@ class FullPipelinedADCSimulator:
             temp_celsius=cfg.temp_celsius
         )
 
-        # Adapt Cs_profile to match cfg.num_stages
         cs_profile = list(cfg.Cs_profile)
         if len(cs_profile) < cfg.num_stages:
             last_val = cs_profile[-1] if len(cs_profile) > 0 else 0.2e-12
@@ -289,6 +307,27 @@ class FullPipelinedADCSimulator:
                     sigma_vref_noise=cfg.sigma_vref_noise, temp_celsius=cfg.temp_celsius
                 )
             )
+
+        # Fix physical OTA transconductance (gm) and time constants (tau = C_L / (beta * gm))
+        total_adc_bits = int(sum(s.effective_bits for s in stages) + cfg.quantizer_bits)
+        sha_specs = sha.calculate_settling_and_gm(
+            Cs_next_stage=stages[0].Cs, total_adc_bits=total_adc_bits,
+            f_clk=cfg.f_clk, t_non_overlap=cfg.t_non_overlap, Vdd=cfg.Vdd
+        )
+        sha.gm = sha_specs["gm_mS"] * 1e-3
+        cl_sha = sha.calculate_cl_load(stages[0].Cs)
+        sha.tau = cl_sha / (sha.beta * sha.gm)
+
+        for i, stage in enumerate(stages):
+            cs_next = stages[i+1].Cs if (i + 1 < len(stages)) else 0.0
+            bits_rem = sum(s.effective_bits for s in stages[i:]) + cfg.quantizer_bits
+            specs = stage.calculate_settling_and_gm(
+                Cs_next_stage=cs_next, remaining_bits=bits_rem,
+                f_clk=cfg.f_clk, t_non_overlap=cfg.t_non_overlap, Vdd=cfg.Vdd
+            )
+            stage.gm = specs["gm_mS"] * 1e-3
+            cl_stage = stage.calculate_cl_load(cs_next)
+            stage.tau = cl_stage / (stage.beta * stage.gm)
 
         return cls(sha=sha, stages=stages, quantizer_bits=cfg.quantizer_bits, Vdd=cfg.Vdd)
 
@@ -344,16 +383,18 @@ class FullPipelinedADCSimulator:
 
         return pd.DataFrame(results), summary
 
-    def run_transient_simulation(self, vin_se_array, Vcm_in=0.5):
+    def run_transient_simulation(self, vin_se_array, Vcm_in=0.5, f_clk=None, t_non_overlap=0.4e-9):
         N = len(vin_se_array)
         digital_codes = np.zeros((N, len(self.stages) + 1))
         
-        v_diff = self.sha.process_signal(vin_se_array, Vcm_in=Vcm_in)
+        t_settle = (1.0 / (2.0 * f_clk)) - t_non_overlap if f_clk is not None else None
+        
+        v_diff = self.sha.process_signal(vin_se_array, Vcm_in=Vcm_in, t_settle=t_settle)
 
         for n in range(N):
             v_in = v_diff[n]
             for stage_idx, stage in enumerate(self.stages):
-                D, v_res = stage.process_sample(v_in)
+                D, v_res = stage.process_sample(v_in, t_settle=t_settle)
                 digital_codes[n, stage_idx] = D
                 v_in = v_res
             
