@@ -1,54 +1,22 @@
 # run_experiments.py
+from dataclasses import replace
 import numpy as np
 import matplotlib.pyplot as plt
 
-# Import simulator classes from our core engine module
-from adc_simulator import ConventionalSHA, NonIdealMDACStage, FullPipelinedADCSimulator
-
-
-# ==============================================================================
-# HELPER: BUILD STANDARD ADC INSTANCE
-# ==============================================================================
-def build_adc(
-    gamma=1.5, 
-    temp_c=27.0, 
-    sigma_vref=0.001, 
-    sigma_mismatch=0.001, 
-    sigma_offset=0.012
-):
-    """Utility function to construct a standard 9-bit Pipelined ADC."""
-    sha = ConventionalSHA(
-        Cs=2.5e-12, Cf=2.5e-12, Cp=0.15e-12, C_out_par=0.08e-12,
-        C_cmfb=0.25e-12, A0_db=75.0, gm_over_id=12.0,
-        gamma_transistor=gamma, temp_celsius=temp_c
-    )
-    
-    # 8-stage MDAC tapered profile
-    Cs_profile = [2.0e-12, 1.2e-12, 0.8e-12, 0.5e-12, 0.3e-12, 0.2e-12, 0.2e-12, 0.2e-12]
-    stages = [
-        NonIdealMDACStage(
-            stage_num=i+1, bits=1.5, Cs=c, Cf=c, Cp=0.1e-12, C_out_par=0.05e-12,
-            C_cmfb=0.15e-12, Vref=1.0, A0_db=65.0, gamma_transistor=gamma,
-            gm_over_id=12.0, sigma_cap_mismatch=sigma_mismatch,
-            sigma_comp_offset=sigma_offset, sigma_vref_noise=sigma_vref,
-            temp_celsius=temp_c
-        ) for i, c in enumerate(Cs_profile)
-    ]
-    
-    return FullPipelinedADCSimulator(sha=sha, stages=stages, quantizer_bits=2, Vdd=1.2)
+from adc_simulator import ADCConfig, FullPipelinedADCSimulator
 
 
 # ==============================================================================
 # EXPERIMENT 0: BASIC FUNCTIONALITY (SANITY CHECK)
 # ==============================================================================
-def run_sanity_check():
+def run_sanity_check(cfg: ADCConfig):
     print("\n" + "="*70)
     print(" EXPERIMENT 0: BASIC FUNCTIONALITY (SANITY CHECK)")
     print("="*70)
 
-    adc = build_adc(gamma=1.5, temp_c=27.0, sigma_vref=0.0005)
+    adc = FullPipelinedADCSimulator.from_config(cfg)
 
-    df_breakdown, summary = adc.run_static_analysis(f_clk=100e6)
+    df_breakdown, summary = adc.run_static_analysis(f_clk=cfg.f_clk, t_non_overlap=cfg.t_non_overlap)
     print("\n--- STAGE-BY-STAGE BREAKDOWN ---")
     print(df_breakdown.to_string(index=False))
     print("\n--- SYSTEM SUMMARY ---")
@@ -59,9 +27,9 @@ def run_sanity_check():
     M_bin = 31
     t = np.arange(num_samples)
     f_in = M_bin / num_samples
-    vin_sine = 0.5 + 0.48 * np.sin(2 * np.pi * f_in * t)
+    vin_sine = cfg.Vcm_in + (0.48 * cfg.Vref) * np.sin(2 * np.pi * f_in * t)
 
-    recon_sine = adc.run_transient_simulation(vin_sine, Vcm_in=0.5)
+    recon_sine = adc.run_transient_simulation(vin_sine, Vcm_in=cfg.Vcm_in)
     sndr, sfdr, enob, spectrum_db = adc.compute_coherent_fft_metrics(recon_sine, M_bin)
 
     print("\n--- DYNAMIC METRICS (Coherent FFT) ---")
@@ -73,14 +41,15 @@ def run_sanity_check():
 # ==============================================================================
 # EXPERIMENT 1: TEMPERATURE SWEEP
 # ==============================================================================
-def run_temperature_sweep(temp_range=np.linspace(-40, 125, 12)):
+def run_temperature_sweep(base_cfg: ADCConfig, temp_range=np.linspace(-40, 125, 12)):
     print("\n" + "="*70)
     print(" EXPERIMENT 1: TEMPERATURE SWEEP (-40°C to +125°C)")
     print("="*70)
     
     snr_list = []
     for temp_c in temp_range:
-        adc = build_adc(temp_c=temp_c, sigma_vref=0.0)
+        cfg = replace(base_cfg, temp_celsius=temp_c, sigma_vref_noise=0.0)
+        adc = FullPipelinedADCSimulator.from_config(cfg)
         _, summary = adc.run_static_analysis()
         snr_val = float(summary["Thermal SNR"].split()[0])
         snr_list.append(snr_val)
@@ -99,14 +68,15 @@ def run_temperature_sweep(temp_range=np.linspace(-40, 125, 12)):
 # ==============================================================================
 # EXPERIMENT 2: TRANSISTOR GAMMA SWEEP
 # ==============================================================================
-def run_gamma_sweep(gamma_range=np.linspace(0.67, 2.5, 10)):
+def run_gamma_sweep(base_cfg: ADCConfig, gamma_range=np.linspace(0.67, 2.5, 10)):
     print("\n" + "="*70)
     print(" EXPERIMENT 2: TRANSISTOR GAMMA SWEEP (0.67 to 2.5)")
     print("="*70)
 
     snr_list = []
     for g_val in gamma_range:
-        adc = build_adc(gamma=g_val, sigma_vref=0.0)
+        cfg = replace(base_cfg, gamma_transistor=g_val, sigma_vref_noise=0.0)
+        adc = FullPipelinedADCSimulator.from_config(cfg)
         _, summary = adc.run_static_analysis()
         snr_val = float(summary["Thermal SNR"].split()[0])
         snr_list.append(snr_val)
@@ -125,25 +95,24 @@ def run_gamma_sweep(gamma_range=np.linspace(0.67, 2.5, 10)):
 # ==============================================================================
 # EXPERIMENT 3: VREF NOISE SWEEP
 # ==============================================================================
-def run_vref_noise_sweep(max_vref_noise_mv=1.0, num_points=10):
+def run_vref_noise_sweep(base_cfg: ADCConfig, max_vref_noise_mv=2.0, num_points=20):
     print("\n" + "="*70)
     print(f" EXPERIMENT 3: VREF NOISE SWEEP (0 to {max_vref_noise_mv:.2f} mV RMS)")
     print("="*70)
 
-    # Convert max noise in mV to Volts and create linspace
-    max_vref_noise_v = max_vref_noise_mv / 1000.0
-    vref_noise_range = np.linspace(0.0, max_vref_noise_v, num_points)
+    vref_noise_range = np.linspace(0.0, max_vref_noise_mv / 1000.0, num_points)
 
     num_samples = 2048
     M_bin = 31
     t = np.arange(num_samples)
     f_in = M_bin / num_samples
-    vin_sine = 0.5 + 0.48 * np.sin(2 * np.pi * f_in * t)
+    vin_sine = base_cfg.Vcm_in + (0.48 * base_cfg.Vref) * np.sin(2 * np.pi * f_in * t)
 
     sndr_list = []
     for vnoise in vref_noise_range:
-        adc = build_adc(sigma_vref=vnoise)
-        recon = adc.run_transient_simulation(vin_sine)
+        cfg = replace(base_cfg, sigma_vref_noise=vnoise)
+        adc = FullPipelinedADCSimulator.from_config(cfg)
+        recon = adc.run_transient_simulation(vin_sine, Vcm_in=cfg.Vcm_in)
         sndr_val, _, _, _ = adc.compute_coherent_fft_metrics(recon, M_bin)
         sndr_list.append(sndr_val)
         print(f"  Vref Noise = {vnoise*1e3:.2f} mV RMS  -->  Dynamic SNDR = {sndr_val:.2f} dB")
@@ -162,6 +131,7 @@ def run_vref_noise_sweep(max_vref_noise_mv=1.0, num_points=10):
 # EXPERIMENT 4: CONSTANT SNR VREF SWEEP (TOTAL CAPACITANCE)
 # ==============================================================================
 def run_capacitance_vs_vref_sweep(
+    base_cfg: ADCConfig, 
     target_snr_db=70.0, 
     vref_pp_range=np.linspace(0.5, 4.0, 20)
 ):
@@ -176,26 +146,27 @@ def run_capacitance_vs_vref_sweep(
         vref_peak = vref_pp / 2.0
         Cs_base = 1.0e-12
 
-        sha_test = ConventionalSHA(Cs=1.25*Cs_base, Cf=1.25*Cs_base, C_cmfb=0.15*Cs_base)
-        stages_test = [
-            NonIdealMDACStage(stage_num=i+1, Cs=Cs_base*tap, Cf=Cs_base*tap, C_cmfb=0.15*Cs_base*tap, Vref=vref_peak)
-            for i, tap in enumerate(taper_profile)
-        ]
-        adc_test = FullPipelinedADCSimulator(sha=sha_test, stages=stages_test)
+        # 1. Baseline test
+        test_cfg = replace(
+            base_cfg, Vref=vref_peak, sha_Cs=1.25*Cs_base, sha_Cf=1.25*Cs_base, sha_C_cmfb=0.15*Cs_base,
+            Cs_profile=[Cs_base*tap for tap in taper_profile], mdac_C_cmfb=0.15*Cs_base
+        )
+        adc_test = FullPipelinedADCSimulator.from_config(test_cfg)
         _, summary_test = adc_test.run_static_analysis()
         snr_base_linear = 10 ** (float(summary_test["Thermal SNR"].split()[0]) / 10.0)
 
+        # 2. Scale capacitors to hit target SNR
         target_snr_linear = 10 ** (target_snr_db / 10.0)
         Cs_scaled = Cs_base * (target_snr_linear / snr_base_linear)
 
-        sha_final = ConventionalSHA(Cs=1.25*Cs_scaled, Cf=1.25*Cs_scaled, C_cmfb=0.15*Cs_scaled)
-        stages_final = [
-            NonIdealMDACStage(stage_num=i+1, Cs=Cs_scaled*tap, Cf=Cs_scaled*tap, C_cmfb=0.15*Cs_scaled*tap, Vref=vref_peak)
-            for i, tap in enumerate(taper_profile)
-        ]
+        final_cfg = replace(
+            base_cfg, Vref=vref_peak, sha_Cs=1.25*Cs_scaled, sha_Cf=1.25*Cs_scaled, sha_C_cmfb=0.15*Cs_scaled,
+            Cs_profile=[Cs_scaled*tap for tap in taper_profile], mdac_C_cmfb=0.15*Cs_scaled
+        )
+        adc_final = FullPipelinedADCSimulator.from_config(final_cfg)
 
-        c_sha = sha_final.Cs + sha_final.Cf + sha_final.C_cmfb
-        c_mdac = sum(s.Cs + s.Cf + s.C_cmfb for s in stages_final)
+        c_sha = adc_final.sha.Cs + adc_final.sha.Cf + adc_final.sha.C_cmfb
+        c_mdac = sum(s.Cs + s.Cf + s.C_cmfb for s in adc_final.stages)
         tot_pF = (c_sha + c_mdac) * 1e12
         total_caps_pF.append(tot_pF)
 
@@ -229,15 +200,16 @@ def run_capacitance_vs_vref_sweep(
 # ==============================================================================
 # EXPERIMENT 5: DEDICATED STATIC DNL / INL MEASUREMENT
 # ==============================================================================
-def run_dnl_inl_experiment(num_ramp_samples=300000):
+def run_dnl_inl_experiment(base_cfg: ADCConfig, num_ramp_samples=300000):
     print("\n" + "="*70)
     print(" EXPERIMENT 5: STATIC DNL / INL MEASUREMENT")
     print("="*70)
 
-    adc = build_adc(sigma_mismatch=0.001, sigma_offset=0.012)
+    cfg = replace(base_cfg, sigma_cap_mismatch=0.001, sigma_comp_offset=0.012)
+    adc = FullPipelinedADCSimulator.from_config(cfg)
 
     print(f"Running linear ramp simulation with {num_ramp_samples:,} samples...")
-    codes, dnl, inl = adc.run_ramp_dnl_inl(num_ramp_samples=num_ramp_samples)
+    codes, dnl, inl = adc.run_ramp_dnl_inl(num_ramp_samples=num_ramp_samples, Vcm_in=cfg.Vcm_in)
 
     max_dnl = np.max(np.abs(dnl))
     max_inl = np.max(np.abs(inl))
@@ -270,12 +242,36 @@ def run_dnl_inl_experiment(num_ramp_samples=300000):
 
 
 # ==============================================================================
-# MAIN EXECUTION
+# MAIN EXECUTION: EASY PARAMETER SPECIFICATION
 # ==============================================================================
 if __name__ == "__main__":
-    run_sanity_check()
-    run_temperature_sweep()
-    run_gamma_sweep()
-    run_vref_noise_sweep(max_vref_noise_mv=2.0, num_points=20)    
-    run_capacitance_vs_vref_sweep()
-    run_dnl_inl_experiment()
+    
+    main_config = ADCConfig(
+        Vref=1.0,
+        Vdd=1.2,
+        temp_celsius=27.0,
+        gamma_transistor=1.5,
+        
+        # SHA parameters
+        sha_A0_db=75.0,
+        sha_Cs=2.5e-12,
+        sha_C_cmfb=0.25e-12,
+        
+        # MDAC parameters
+        mdac_A0_db=65.0,
+        mdac_C_cmfb=0.15e-12,
+        Cs_profile=[2.0e-12, 1.2e-12, 0.8e-12, 0.5e-12, 0.3e-12, 0.2e-12, 0.2e-12, 0.2e-12],
+        
+        # Non-idealities
+        sigma_cap_mismatch=0.001,
+        sigma_comp_offset=0.012,
+        sigma_vref_noise=0.0005
+    )
+
+    # Run experiments using the central config instance
+    run_sanity_check(main_config)
+    run_temperature_sweep(main_config)
+    run_gamma_sweep(main_config)
+    run_vref_noise_sweep(main_config, max_vref_noise_mv=2.0, num_points=20)
+    run_capacitance_vs_vref_sweep(main_config)
+    run_dnl_inl_experiment(main_config)

@@ -1,4 +1,6 @@
 # adc_simulator.py
+from dataclasses import dataclass, field
+from typing import List
 import numpy as np
 import pandas as pd
 
@@ -8,6 +10,57 @@ def celsius_to_kelvin(temp_celsius):
     return temp_celsius + 273.15
 
 
+# ==============================================================================
+# CONFIGURATION DATA CLASS
+# ==============================================================================
+@dataclass
+class ADCConfig:
+    """Master configuration class for Pipelined ADC parameters."""
+    # Supply & References
+    Vref: float = 1.0                # Peak reference voltage (Volts)
+    Vdd: float = 1.2                 # Supply voltage (Volts)
+    Vcm_in: float = 0.5              # Input common-mode voltage (Volts)
+    
+    # Clocking
+    f_clk: float = 100e6             # Clock frequency (Hz)
+    t_non_overlap: float = 0.4e-9    # Non-overlapping clock time (seconds)
+    
+    # Resolution Specs
+    quantizer_bits: int = 2          # Back-end flash quantizer bits
+    mdac_bits: float = 1.5           # Stage resolution (1.5-bit per MDAC)
+    
+    # Environmental & Transistor Technology
+    temp_celsius: float = 27.0       # Temperature (°C)
+    gamma_transistor: float = 1.5    # Transistor excess noise factor
+    
+    # Non-idealities & Noise
+    sigma_cap_mismatch: float = 0.001   # Capacitor mismatch std dev (0.1%)
+    sigma_comp_offset: float = 0.012    # Sub-ADC comp offset std dev (12 mV)
+    sigma_vref_noise: float = 0.0005    # Vref noise std dev (0.5 mV RMS)
+    
+    # Front-End SHA Parameters
+    sha_Cs: float = 2.5e-12
+    sha_Cf: float = 2.5e-12
+    sha_Cp: float = 0.15e-12
+    sha_C_out_par: float = 0.08e-12
+    sha_C_cmfb: float = 0.25e-12
+    sha_A0_db: float = 75.0
+    sha_gm_over_id: float = 12.0
+    
+    # MDAC Stage Default Parameters
+    Cs_profile: List[float] = field(default_factory=lambda: [
+        2.0e-12, 1.2e-12, 0.8e-12, 0.5e-12, 0.3e-12, 0.2e-12, 0.2e-12, 0.2e-12
+    ])
+    mdac_Cp: float = 0.1e-12
+    mdac_C_out_par: float = 0.05e-12
+    mdac_C_cmfb: float = 0.15e-12
+    mdac_A0_db: float = 65.0
+    mdac_gm_over_id: float = 12.0
+
+
+# ==============================================================================
+# 1. FRONT-END SAMPLE-AND-HOLD
+# ==============================================================================
 class ConventionalSHA:
     """Conventional (Non-Flip-Around) Single-Ended to Differential S/H."""
     def __init__(
@@ -70,6 +123,9 @@ class ConventionalSHA:
         return Vin_diff * self.actual_gain
 
 
+# ==============================================================================
+# 2. PIPELINED MDAC STAGE
+# ==============================================================================
 class NonIdealMDACStage:
     """1.5-Bit Differential MDAC Stage."""
     def __init__(
@@ -161,6 +217,9 @@ class NonIdealMDACStage:
         return D, Vres
 
 
+# ==============================================================================
+# 3. MASTER PIPELINE SIMULATOR
+# ==============================================================================
 class FullPipelinedADCSimulator:
     """Master Pipeline ADC System."""
     def __init__(self, sha, stages, quantizer_bits=2, Vdd=1.2):
@@ -169,6 +228,28 @@ class FullPipelinedADCSimulator:
         self.quantizer_bits = quantizer_bits
         self.Vdd = Vdd
         self.total_bits = int(sum(s.effective_bits for s in self.stages) + self.quantizer_bits)
+
+    @classmethod
+    def from_config(cls, cfg: ADCConfig):
+        """Constructs full simulator directly from an ADCConfig instance."""
+        sha = ConventionalSHA(
+            Cs=cfg.sha_Cs, Cf=cfg.sha_Cf, Cp=cfg.sha_Cp, C_out_par=cfg.sha_C_out_par,
+            C_cmfb=cfg.sha_C_cmfb, A0_db=cfg.sha_A0_db, gm_over_id=cfg.sha_gm_over_id,
+            gamma_transistor=cfg.gamma_transistor, temp_celsius=cfg.temp_celsius
+        )
+
+        stages = [
+            NonIdealMDACStage(
+                stage_num=i + 1, bits=cfg.mdac_bits, Cs=cs_val, Cf=cs_val,
+                Cp=cfg.mdac_Cp, C_out_par=cfg.mdac_C_out_par, C_cmfb=cfg.mdac_C_cmfb,
+                Vref=cfg.Vref, A0_db=cfg.mdac_A0_db, gamma_transistor=cfg.gamma_transistor,
+                gm_over_id=cfg.mdac_gm_over_id, sigma_cap_mismatch=cfg.sigma_cap_mismatch,
+                sigma_comp_offset=cfg.sigma_comp_offset, sigma_vref_noise=cfg.sigma_vref_noise,
+                temp_celsius=cfg.temp_celsius
+            ) for i, cs_val in enumerate(cfg.Cs_profile)
+        ]
+
+        return cls(sha=sha, stages=stages, quantizer_bits=cfg.quantizer_bits, Vdd=cfg.Vdd)
 
     def run_static_analysis(self, f_clk=100e6, t_non_overlap=0.4e-9):
         results = []
@@ -266,7 +347,6 @@ class FullPipelinedADCSimulator:
         return sndr_db, sfdr_db, enob, spectrum_db
 
     def float_to_code(self, v_reconstructed):
-        """Maps reconstructed float [-Vref, +Vref] to discrete integer codes."""
         num_codes = 2 ** self.total_bits
         Vref = self.stages[0].Vref
         v_norm = (v_reconstructed + Vref) / (2.0 * Vref)
@@ -274,45 +354,26 @@ class FullPipelinedADCSimulator:
         return np.clip(codes, 0, num_codes - 1)
 
     def run_ramp_dnl_inl(self, num_ramp_samples=300000, Vcm_in=0.5, overdrive=1.04, guard_codes=4):
-        """
-        Calculates DNL and End-Point INL using IEEE Std 1241 linear ramp method.
-        
-        Parameters:
-            num_ramp_samples : Total samples in the ramp sweep.
-            Vcm_in           : Common-mode input voltage.
-            overdrive        : Overdrive scale factor (1.04 = 104% full scale).
-            guard_codes      : Number of boundary codes to trim to avoid edge saturation.
-        """
         Vref = self.stages[0].Vref
-        
-        # 1. Generate overdriven linear ramp sweep
         vin_ramp = np.linspace(Vcm_in - Vref * overdrive, Vcm_in + Vref * overdrive, num_ramp_samples)
         
-        # 2. Run transient simulation
         reconstructed = self.run_transient_simulation(vin_ramp, Vcm_in=Vcm_in)
         codes = self.float_to_code(reconstructed)
 
         num_codes = 2 ** self.total_bits
         H = np.bincount(codes, minlength=num_codes)
 
-        # 3. Trim boundary codes affected by saturation clipping
         valid_indices = np.where(H > 0)[0]
         first_code = max(guard_codes, valid_indices[0] + guard_codes)
         last_code = min(num_codes - 1 - guard_codes, valid_indices[-1] - guard_codes)
 
-        # 4. Extract hits for interior linear codes
         H_valid = H[first_code : last_code + 1]
         ideal_hits_per_code = np.mean(H_valid)
 
-        # 5. Compute DNL
         dnl = (H_valid / ideal_hits_per_code) - 1.0
-
-        # 6. Compute End-Point Corrected INL (IEEE Std 1241)
-        # Removes overall gain/offset linear drift so INL starts and ends at 0 LSB
         inl_raw = np.cumsum(dnl)
         linear_trend = np.linspace(inl_raw[0], inl_raw[-1], len(inl_raw))
         inl = inl_raw - linear_trend
 
         code_axis = np.arange(first_code, last_code + 1)
-
         return code_axis, dnl, inl
