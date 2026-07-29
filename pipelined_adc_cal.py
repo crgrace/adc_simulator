@@ -28,7 +28,7 @@ class CalADCConfig:
     mu_shift: int = 6                 # LMS step size power-of-2 right shift (mu = 2^-6 = 0.015625)
     
     # Calibration Cycles
-    cal_cycles_per_stage: int = 2000  # Number of calibration clock cycles per stage
+    cal_cycles_per_stage: int = 2000  # Baseline number of calibration clock cycles per stage
     
     # Non-idealities & Process Mismatches (2.5V Thick-Oxide, 0.5% Gain Error)
     gain_error_std: float = 0.005     # 0.5% RMS relative linear stage gain error
@@ -434,7 +434,7 @@ def run_design_space_exploration():
         gain_error_std=0.005,        # 0.5% RMS stage gain error
         cap_mismatch_std=0.0008,     # 0.08% capacitor mismatch
         ota_a0_db=68.0,              # 68 dB OTA open-loop gain
-        cal_cycles_per_stage=2000,   # Calibration cycles
+        cal_cycles_per_stage=2000,   # Baseline calibration cycles
         seed=42
     )
 
@@ -487,7 +487,7 @@ def run_design_space_exploration():
         sndr_vs_cycles.append(s_val)
 
     # --------------------------------------------------------------------------
-    # 3. HARDWARE WORDLENGTH SWEEPS
+    # 3. HARDWARE WORDLENGTH & STEP-SIZE SWEEPS (NORMALIZED TIME CONSTANTS)
     # --------------------------------------------------------------------------
     print("\nExecuting Hardware Sweep 1: Unified Register Width (B_reg) Sweep...")
     reg_bits_range = list(range(12, 25, 2))
@@ -499,11 +499,14 @@ def run_design_space_exploration():
         s_val, _, _, _, _ = adc_sweep.run_transient_sine(use_calibrated=True)
         sndr_vs_reg_bits.append(s_val)
 
-    print("Executing Hardware Sweep 2: LMS Step-Size Shift (mu_shift) Sweep...")
-    mu_shifts_range = list(range(3, 11))
+    print("Executing Hardware Sweep 2: LMS Step-Size Shift (mu_shift) Sweep (Normalized Adaptation Time)...")
+    mu_shifts_range = list(range(2, 11))
     sndr_vs_mu_shift = []
     for s_mu in mu_shifts_range:
-        cfg_sweep = replace(base_cfg, mu_shift=s_mu)
+        # Double the calibration cycles every time step size mu is halved (shift +1)
+        # Keeps total adaptation time relative to loop time constant (tau = 2^S) constant
+        scaled_cycles = int(round(base_cfg.cal_cycles_per_stage * (2 ** (s_mu - base_cfg.mu_shift))))
+        cfg_sweep = replace(base_cfg, mu_shift=s_mu, cal_cycles_per_stage=scaled_cycles)
         adc_sweep = calADC.from_config(cfg_sweep)
         adc_sweep.run_calibration()
         s_val, _, _, _, _ = adc_sweep.run_transient_sine(use_calibrated=True)
@@ -568,11 +571,11 @@ def run_design_space_exploration():
     ax2_1.set_title("1. Performance vs. Hardware Register Wordlength", fontweight='bold')
     ax2_1.grid(True, linestyle=':', alpha=0.6)
 
-    # Panel 2: SNDR vs LMS Hardware Shift (mu_shift = 2^-S)
+    # Panel 2: SNDR vs LMS Hardware Shift (mu_shift = 2^-S, Normalized Cycles)
     ax2_2.plot(mu_shifts_range, sndr_vs_mu_shift, 's-', color='tab:olive', lw=2)
     ax2_2.set_xlabel("LMS Shift Parameter S (mu = 2^-S)", fontsize=10)
     ax2_2.set_ylabel("Calibrated Dynamic SNDR (dB)", fontsize=10)
-    ax2_2.set_title("2. Performance vs. Hardware Step Size (mu_shift)", fontweight='bold')
+    ax2_2.set_title("2. Performance vs. Hardware Step Size (Normalized Time)", fontweight='bold')
     ax2_2.grid(True, linestyle=':', alpha=0.6)
 
     fig2.suptitle(f"calADC Integer Hardware Wordlength Analysis ({base_cfg.total_bits}-Bit Nominal Pipeline)", fontsize=13, fontweight='bold')
