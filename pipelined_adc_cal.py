@@ -557,9 +557,9 @@ def run_design_space_exploration():
     plt.show()
 
     # ==========================================================================
-    # FIGURE 2: HARDWARE WORDLENGTH & STATIC NON-LINEARITY DASHBOARD
+    # FIGURE 2: HARDWARE WORDLENGTH DASHBOARD
     # ==========================================================================
-    fig2, ((ax2_1, ax2_2), (ax2_3, ax2_4)) = plt.subplots(2, 2, figsize=(13, 9.5))
+    fig2, (ax2_1, ax2_2) = plt.subplots(1, 2, figsize=(13, 4.8))
 
     # Panel 1: SNDR vs Datapath Register Wordlength (B_reg)
     ax2_1.plot(reg_bits_range, sndr_vs_reg_bits, 'o-', color='indigo', lw=2)
@@ -575,28 +575,52 @@ def run_design_space_exploration():
     ax2_2.set_title("2. Performance vs. Hardware Step Size (mu_shift)", fontweight='bold')
     ax2_2.grid(True, linestyle=':', alpha=0.6)
 
-    # Panel 3: Static DNL Comparison
-    ax2_3.plot(code_axis_u, dnl_u, color='tab:red', alpha=0.6, lw=0.8, label=f'Uncal (Max={np.max(np.abs(dnl_u)):.2f} LSB)')
-    ax2_3.plot(code_axis_c, dnl_cal, color='tab:blue', lw=1.0, label=f'Cal (Max={np.max(np.abs(dnl_cal)):.2f} LSB)')
-    ax2_3.axhline(0.5, color='black', linestyle=':', lw=0.8)
-    ax2_3.axhline(-0.5, color='black', linestyle=':', lw=0.8)
-    ax2_3.set_xlabel("Digital Output Code", fontsize=10)
-    ax2_3.set_ylabel("DNL (LSB)", fontsize=10)
-    ax2_3.set_title("3. Differential Non-Linearity (DNL)", fontweight='bold')
-    ax2_3.grid(True, linestyle=':', alpha=0.6)
-    ax2_3.legend(loc='upper right', fontsize=8)
-
-    # Panel 4: Static INL Comparison
-    ax2_4.plot(code_axis_u, inl_u, color='tab:red', alpha=0.7, lw=1.0, label=f'Uncal (Max={np.max(np.abs(inl_u)):.2f} LSB)')
-    ax2_4.plot(code_axis_c, inl_cal, color='tab:blue', lw=1.5, label=f'Cal (Max={np.max(np.abs(inl_cal)):.2f} LSB)')
-    ax2_4.set_xlabel("Digital Output Code", fontsize=10)
-    ax2_4.set_ylabel("INL (LSB)", fontsize=10)
-    ax2_4.set_title("4. Integral Non-Linearity (INL)", fontweight='bold')
-    ax2_4.grid(True, linestyle=':', alpha=0.6)
-    ax2_4.legend(loc='upper right', fontsize=8)
-
-    fig2.suptitle(f"calADC Integer Hardware & Static Analysis ({base_cfg.total_bits}-Bit Nominal Pipeline)", fontsize=13, fontweight='bold')
+    fig2.suptitle(f"calADC Integer Hardware Wordlength Analysis ({base_cfg.total_bits}-Bit Nominal Pipeline)", fontsize=13, fontweight='bold')
     fig2.tight_layout()
+    plt.show()
+
+    # ==========================================================================
+    # FIGURE 3: STATIC NON-LINEARITY ANALYSIS (SEPARATE UNCAL & CAL PLOTS)
+    # ==========================================================================
+    fig3, ((ax3_1, ax3_2), (ax3_3, ax3_4)) = plt.subplots(2, 2, figsize=(13, 9.5))
+
+    # Subplot 1: Uncalibrated DNL
+    ax3_1.plot(code_axis_u, dnl_u, color='tab:red', lw=0.8)
+    ax3_1.axhline(0, color='black', lw=0.8, linestyle='--')
+    ax3_1.set_xlabel("Digital Output Code", fontsize=10)
+    ax3_1.set_ylabel("DNL (LSB)", fontsize=10)
+    ax3_1.set_title(f"1. Uncalibrated DNL (Max |DNL| = {np.max(np.abs(dnl_u)):.2f} LSB)", fontweight='bold')
+    ax3_1.grid(True, linestyle=':', alpha=0.6)
+
+    # Subplot 2: Calibrated DNL (Rescaled to show sub-LSB details)
+    ax3_2.plot(code_axis_c, dnl_cal, color='tab:blue', lw=1.0)
+    ax3_2.axhline(0, color='black', lw=0.8, linestyle='--')
+    ax3_2.axhline(0.5, color='crimson', linestyle=':', lw=1.0, label='±0.5 LSB Target')
+    ax3_2.axhline(-0.5, color='crimson', linestyle=':', lw=1.0)
+    ax3_2.set_xlabel("Digital Output Code", fontsize=10)
+    ax3_2.set_ylabel("DNL (LSB)", fontsize=10)
+    ax3_2.set_title(f"2. Calibrated DNL (Max |DNL| = {np.max(np.abs(dnl_cal)):.2f} LSB)", fontweight='bold')
+    ax3_2.grid(True, linestyle=':', alpha=0.6)
+    ax3_2.legend(loc='upper right', fontsize=8)
+
+    # Subplot 3: Uncalibrated INL
+    ax3_3.plot(code_axis_u, inl_u, color='tab:red', lw=1.0)
+    ax3_3.axhline(0, color='black', lw=0.8, linestyle='--')
+    ax3_3.set_xlabel("Digital Output Code", fontsize=10)
+    ax3_3.set_ylabel("INL (LSB)", fontsize=10)
+    ax3_3.set_title(f"3. Uncalibrated INL (Max |INL| = {np.max(np.abs(inl_u)):.2f} LSB)", fontweight='bold')
+    ax3_3.grid(True, linestyle=':', alpha=0.6)
+
+    # Subplot 4: Calibrated INL (Rescaled to show sub-LSB details)
+    ax3_4.plot(code_axis_c, inl_cal, color='tab:blue', lw=1.2)
+    ax3_4.axhline(0, color='black', lw=0.8, linestyle='--')
+    ax3_4.set_xlabel("Digital Output Code", fontsize=10)
+    ax3_4.set_ylabel("INL (LSB)", fontsize=10)
+    ax3_4.set_title(f"4. Calibrated INL (Max |INL| = {np.max(np.abs(inl_cal)):.2f} LSB)", fontweight='bold')
+    ax3_4.grid(True, linestyle=':', alpha=0.6)
+
+    fig3.suptitle(f"calADC Static Linearity Study — Pre- vs. Post-Calibration ({base_cfg.total_bits}-Bit Nominal)", fontsize=13, fontweight='bold')
+    fig3.tight_layout()
     plt.show()
 
 
