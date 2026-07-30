@@ -15,6 +15,7 @@ class CalADCConfig:
     num_stages: int = 16              # Total number of 1.5-bit MDAC stages in pipeline
     num_calibrated_stages: int = 5    # Number of front-end stages to calibrate (1 to M)
     backend_bits: int = 2             # Final flash quantizer bits (2-bit termination after Stage N)
+    effective_resolution: Optional[int] = 12  # Target output resolution for evaluation (e.g., 12 bits)
     
     # Supply & Reference Voltages (2.5V Thick-Oxide Process)
     Vdd: float = 2.5                  # Supply voltage (Volts)
@@ -28,7 +29,7 @@ class CalADCConfig:
     mu_shift: int = 6                 # LMS step size power-of-2 right shift (mu = 2^-6 = 0.015625)
     
     # Calibration Cycles
-    cal_cycles_per_stage: int = 2000  # Baseline number of calibration clock cycles per stage
+    cal_cycles_per_stage: int = 2000  # Number of calibration clock cycles per stage
     
     # Non-idealities & Process Mismatches (2.5V Thick-Oxide, 0.5% Gain Error)
     gain_error_std: float = 0.005     # 0.5% RMS relative linear stage gain error
@@ -51,8 +52,13 @@ class CalADCConfig:
 
     @property
     def total_bits(self) -> int:
-        """Total nominal resolution = N_stages + backend_bits - 1."""
+        """Total nominal pipeline resolution = N_stages + backend_bits - 1."""
         return int(self.num_stages + self.backend_bits - 1)
+
+    @property
+    def eval_bits(self) -> int:
+        """Target output resolution used for final rounding, FFT, and DNL/INL evaluation."""
+        return self.effective_resolution if self.effective_resolution is not None else self.total_bits
 
 
 # ==============================================================================
@@ -123,10 +129,10 @@ class BackendQuantizer:
 
 
 # ==============================================================================
-# 3. calADC SIMULATOR CLASS (INTEGER DATAPATH WITH SAFE SHIFT ALIGNMENT)
+# 3. calADC SIMULATOR CLASS (INTEGER DATAPATH + OUTPUT ROUNDING)
 # ==============================================================================
 class calADC:
-    """Pipelined ADC featuring integer or floating-point digital LMS calibration."""
+    """Pipelined ADC featuring integer digital LMS calibration and N-bit effective output rounding."""
     def __init__(self, cfg: CalADCConfig):
         self.cfg = cfg
         self.num_stages = cfg.num_stages
@@ -184,6 +190,14 @@ class calADC:
         max_val = (1 << (bits - 1)) - 1
         min_val = -(1 << (bits - 1))
         return int(np.clip(val, min_val, max_val))
+
+    def quantize_to_eval_bits(self, y_normalized: np.ndarray) -> np.ndarray:
+        """Rounds/truncates high-precision normalized output [-1.0, 1.0) to cfg.eval_bits grid."""
+        bits = self.cfg.eval_bits
+        num_codes = 1 << bits
+        v_norm = np.clip((y_normalized + 1.0) / 2.0, 0.0, 1.0 - 1e-12)
+        codes = np.clip(np.floor(v_norm * num_codes), 0, num_codes - 1)
+        return ((codes + 0.5) / num_codes) * 2.0 - 1.0
 
     # --------------------------------------------------------------------------
     # DIGITAL RECONSTRUCTION ENGINE
@@ -353,18 +367,20 @@ class calADC:
         return Y_next
 
     # --------------------------------------------------------------------------
-    # SIMULATION EVALUATION HELPERS
+    # SIMULATION EVALUATION HELPERS (EVALUATED AT EFFECTIVE_RESOLUTION)
     # --------------------------------------------------------------------------
     def run_transient_sine(self, num_samples=2048, M_bin=31, use_calibrated=True) -> Tuple[float, float, float, np.ndarray, np.ndarray]:
         t = np.arange(num_samples)
         f_in = M_bin / num_samples
         vin_sine = 0.96 * self.Vref * np.sin(2 * np.pi * f_in * t)
         
-        y_recon = np.zeros(num_samples)
+        y_recon_raw = np.zeros(num_samples)
         for n in range(num_samples):
             codes, backend_val = self._sample_downstream(0, vin_sine[n])
-            y_recon[n] = self.reconstruct_sample(codes, backend_val, use_calibrated=use_calibrated)
+            y_recon_raw[n] = self.reconstruct_sample(codes, backend_val, use_calibrated=use_calibrated)
             
+        y_recon = self.quantize_to_eval_bits(y_recon_raw)
+
         fft_spec = np.abs(np.fft.rfft(y_recon)) / (num_samples / 2.0)
         fft_spec[0] = 0.0
         signal_pwr = fft_spec[M_bin] ** 2
@@ -379,17 +395,18 @@ class calADC:
         return sndr_db, sfdr_db, enob, 20 * np.log10(fft_spec + 1e-12), y_recon
 
     def run_ramp_dnl_inl(self, num_samples=None, use_calibrated=True) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        eval_bits = self.cfg.eval_bits
         if num_samples is None:
-            num_samples = 10 * (2 ** self.total_bits)
+            num_samples = 10 * (2 ** eval_bits)
 
         vin_ramp = np.linspace(-1.02 * self.Vref, 1.02 * self.Vref, num_samples)
-        y_recon = np.zeros(num_samples)
+        y_recon_raw = np.zeros(num_samples)
         for n in range(num_samples):
             codes, backend_val = self._sample_downstream(0, vin_ramp[n])
-            y_recon[n] = self.reconstruct_sample(codes, backend_val, use_calibrated=use_calibrated)
+            y_recon_raw[n] = self.reconstruct_sample(codes, backend_val, use_calibrated=use_calibrated)
             
-        num_codes = 2 ** self.total_bits
-        v_norm = (y_recon + 1.0) / 2.0
+        num_codes = 2 ** eval_bits
+        v_norm = np.clip((y_recon_raw + 1.0) / 2.0, 0.0, 1.0 - 1e-12)
         codes = np.clip(np.floor(v_norm * num_codes).astype(int), 0, num_codes - 1)
         
         H = np.bincount(codes, minlength=num_codes)
@@ -412,14 +429,14 @@ class calADC:
 def run_design_space_exploration():
     print("="*75)
     print(" calADC DESIGN SPACE EXPLORATION STUDY (INTEGER ARITHMETIC)")
-    print(" 16-Stage All-1.5b MDAC Pipeline Architecture (17-Bit Nominal)")
+    print(" 16-Stage All-1.5b MDAC Pipeline Architecture")
     print("="*75)
 
-    # Base Integer Configuration (20-bit Datapath, 22-bit Weight Accumulators)
     base_cfg = CalADCConfig(
         num_stages=16,               # 16 total 1.5b MDAC stages
         num_calibrated_stages=5,     # Calibrate stages 1 through 5
-        backend_bits=2,              # 2-bit flash backend (17 bits total nominal)
+        backend_bits=2,              # 2-bit flash backend (17 bits total internal)
+        effective_resolution=12,     # Target output resolution for system evaluation (12 bits)
         Vdd=2.5,                     # 2.5V supply
         Vref=1.2,                    # 1.2V reference (2.4 Vpp diff)
         Vcm_in=1.25,                 # Mid-supply common mode
@@ -434,7 +451,7 @@ def run_design_space_exploration():
         gain_error_std=0.005,        # 0.5% RMS stage gain error
         cap_mismatch_std=0.0008,     # 0.08% capacitor mismatch
         ota_a0_db=68.0,              # 68 dB OTA open-loop gain
-        cal_cycles_per_stage=2000,   # Baseline calibration cycles
+        cal_cycles_per_stage=2000,   # Calibration cycles
         seed=42
     )
 
@@ -450,20 +467,20 @@ def run_design_space_exploration():
     sndr_cal, sfdr_cal, enob_cal, spec_cal, _ = adc_base.run_transient_sine(use_calibrated=True)
     code_axis_c, dnl_cal, inl_cal = adc_base.run_ramp_dnl_inl(use_calibrated=True)
 
-    print(f"\n--- UNCALIBRATED METRICS (N={base_cfg.total_bits} Nominal Bits) ---")
+    print(f"\n--- UNCALIBRATED METRICS (Evaluated at {base_cfg.eval_bits}-Bit Effective / {base_cfg.total_bits}-Bit Pipeline) ---")
     print(f"  Dynamic SNDR : {sndr_uncal:.2f} dB (ENOB = {enob_uncal:.2f} bits)")
     print(f"  Dynamic SFDR : {sfdr_uncal:.2f} dB")
-    print(f"  Max |DNL|    : {np.max(np.abs(dnl_u)):.2f} LSB")
-    print(f"  Max |INL|    : {np.max(np.abs(inl_u)):.2f} LSB")
+    print(f"  Max |DNL|    : {np.max(np.abs(dnl_u)):.2f} LSB ({base_cfg.eval_bits}-bit LSBs)")
+    print(f"  Max |INL|    : {np.max(np.abs(inl_u)):.2f} LSB ({base_cfg.eval_bits}-bit LSBs)")
 
-    print(f"\n--- CALIBRATED INTEGER METRICS ({base_cfg.datapath_bits}-Bit Datapath, {base_cfg.weight_bits}-Bit Weights) ---")
+    print(f"\n--- CALIBRATED METRICS ({base_cfg.eval_bits}-Bit Effective Output / {base_cfg.num_calibrated_stages} Calibrated Stages) ---")
     print(f"  Dynamic SNDR : {sndr_cal:.2f} dB (ENOB = {enob_cal:.2f} bits)  [+{sndr_cal - sndr_uncal:.2f} dB]")
     print(f"  Dynamic SFDR : {sfdr_cal:.2f} dB  [+{sfdr_cal - sfdr_uncal:.2f} dB]")
-    print(f"  Max |DNL|    : {np.max(np.abs(dnl_cal)):.2f} LSB")
-    print(f"  Max |INL|    : {np.max(np.abs(inl_cal)):.2f} LSB")
+    print(f"  Max |DNL|    : {np.max(np.abs(dnl_cal)):.2f} LSB ({base_cfg.eval_bits}-bit LSBs)")
+    print(f"  Max |INL|    : {np.max(np.abs(inl_cal)):.2f} LSB ({base_cfg.eval_bits}-bit LSBs)")
 
     # --------------------------------------------------------------------------
-    # 2. SYSTEM SWEEPS (FIXED BITWIDTH)
+    # 2. SYSTEM SWEEPS
     # --------------------------------------------------------------------------
     print("\nExecuting System Sweep 1: Number of Calibrated Stages Sweep...")
     cal_stage_range = list(range(0, 11))
@@ -487,7 +504,7 @@ def run_design_space_exploration():
         sndr_vs_cycles.append(s_val)
 
     # --------------------------------------------------------------------------
-    # 3. HARDWARE WORDLENGTH & STEP-SIZE SWEEPS (NORMALIZED TIME CONSTANTS)
+    # 3. HARDWARE WORDLENGTH SWEEPS
     # --------------------------------------------------------------------------
     print("\nExecuting Hardware Sweep 1: Unified Register Width (B_reg) Sweep...")
     reg_bits_range = list(range(12, 25, 2))
@@ -499,14 +516,11 @@ def run_design_space_exploration():
         s_val, _, _, _, _ = adc_sweep.run_transient_sine(use_calibrated=True)
         sndr_vs_reg_bits.append(s_val)
 
-    print("Executing Hardware Sweep 2: LMS Step-Size Shift (mu_shift) Sweep (Normalized Adaptation Time)...")
-    mu_shifts_range = list(range(2, 11))
+    print("Executing Hardware Sweep 2: LMS Step-Size Shift (mu_shift = 3 to 16) Sweep...")
+    mu_shifts_range = list(range(3, 17))
     sndr_vs_mu_shift = []
     for s_mu in mu_shifts_range:
-        # Double the calibration cycles every time step size mu is halved (shift +1)
-        # Keeps total adaptation time relative to loop time constant (tau = 2^S) constant
-        scaled_cycles = int(round(base_cfg.cal_cycles_per_stage * (2 ** (s_mu - base_cfg.mu_shift))))
-        cfg_sweep = replace(base_cfg, mu_shift=s_mu, cal_cycles_per_stage=scaled_cycles)
+        cfg_sweep = replace(base_cfg, mu_shift=s_mu, cal_cycles_per_stage=800)
         adc_sweep = calADC.from_config(cfg_sweep)
         adc_sweep.run_calibration()
         s_val, _, _, _, _ = adc_sweep.run_transient_sine(use_calibrated=True)
@@ -527,7 +541,7 @@ def run_design_space_exploration():
     ax1.grid(True, linestyle=':', alpha=0.6)
     ax1.legend(loc='upper right', fontsize=8)
 
-    # Panel 2: Dynamic Spectrum Comparison (DC Bins Omitted)
+    # Panel 2: Dynamic Spectrum Comparison
     start_bin = 3
     freqs = np.linspace(0, 0.5, len(spec_uncal))[start_bin:]
     spec_uncal_clean = spec_uncal[start_bin:]
@@ -537,30 +551,34 @@ def run_design_space_exploration():
     ax2.plot(freqs, spec_cal_clean, color='tab:blue', lw=1.5, label=f'Calibrated ({sndr_cal:.1f} dB)')
     ax2.set_xlabel("Normalized Frequency (f / f_s)", fontsize=10)
     ax2.set_ylabel("Power Spectral Density (dBFS)", fontsize=10)
-    ax2.set_title(f"2. Dynamic Spectrum ({base_cfg.datapath_bits}-Bit Datapath)", fontweight='bold')
+    ax2.set_title(f"2. Dynamic Spectrum ({base_cfg.eval_bits}-Bit Effective Output)", fontweight='bold')
     ax2.grid(True, linestyle=':', alpha=0.6)
     ax2.legend()
 
     # Panel 3: Performance vs. Number of Calibrated Stages
     ax3.plot(cal_stage_range, sndr_vs_stages, 'o-', color='tab:purple', lw=2)
+    ax3.axhline(6.02 * base_cfg.eval_bits + 1.76, color='black', linestyle=':', label=f'Ideal {base_cfg.eval_bits}-Bit SQNR Floor')
     ax3.set_xlabel("Number of Calibrated Stages (Front-to-Back)", fontsize=10)
     ax3.set_ylabel("Calibrated Dynamic SNDR (dB)", fontsize=10)
     ax3.set_title("3. Performance vs. Calibrated Stage Count", fontweight='bold')
     ax3.grid(True, linestyle=':', alpha=0.6)
+    ax3.legend()
 
     # Panel 4: Performance vs. Calibration Cycles per Stage
     ax4.plot(cycles_range, sndr_vs_cycles, 's-', color='tab:green', lw=2)
+    ax4.axhline(6.02 * base_cfg.eval_bits + 1.76, color='black', linestyle=':', label=f'Ideal {base_cfg.eval_bits}-Bit SQNR Floor')
     ax4.set_xlabel("Calibration Clock Cycles per Stage", fontsize=10)
     ax4.set_ylabel("Calibrated Dynamic SNDR (dB)", fontsize=10)
     ax4.set_title("4. Calibration Quality vs. Loop Cycles", fontweight='bold')
     ax4.grid(True, linestyle=':', alpha=0.6)
+    ax4.legend()
 
-    fig1.suptitle(f"calADC Digital Calibration System Dashboard ({base_cfg.total_bits}-Bit Nominal Pipeline)", fontsize=13, fontweight='bold')
+    fig1.suptitle(f"calADC Digital Calibration System Dashboard ({base_cfg.eval_bits}-Bit Effective / {base_cfg.total_bits}-Bit Pipeline)", fontsize=13, fontweight='bold')
     fig1.tight_layout()
     plt.show()
 
     # ==========================================================================
-    # FIGURE 2: HARDWARE WORDLENGTH DASHBOARD
+    # FIGURE 2: HARDWARE FIXED-POINT WORDLENGTH STUDY (1x2 GRID)
     # ==========================================================================
     fig2, (ax2_1, ax2_2) = plt.subplots(1, 2, figsize=(13, 4.8))
 
@@ -571,58 +589,55 @@ def run_design_space_exploration():
     ax2_1.set_title("1. Performance vs. Hardware Register Wordlength", fontweight='bold')
     ax2_1.grid(True, linestyle=':', alpha=0.6)
 
-    # Panel 2: SNDR vs LMS Hardware Shift (mu_shift = 2^-S, Normalized Cycles)
+    # Panel 2: SNDR vs LMS Hardware Shift (mu_shift = 3 to 16)
     ax2_2.plot(mu_shifts_range, sndr_vs_mu_shift, 's-', color='tab:olive', lw=2)
+    ax2_2.axhline(sndr_uncal, color='tab:red', linestyle='--', label=f'Uncalibrated Floor ({sndr_uncal:.1f} dB)')
     ax2_2.set_xlabel("LMS Shift Parameter S (mu = 2^-S)", fontsize=10)
     ax2_2.set_ylabel("Calibrated Dynamic SNDR (dB)", fontsize=10)
-    ax2_2.set_title("2. Performance vs. Hardware Step Size (Normalized Time)", fontweight='bold')
+    ax2_2.set_title("2. Performance vs. Step Size (Showing True Peaked Curve)", fontweight='bold')
     ax2_2.grid(True, linestyle=':', alpha=0.6)
+    ax2_2.legend()
 
-    fig2.suptitle(f"calADC Integer Hardware Wordlength Analysis ({base_cfg.total_bits}-Bit Nominal Pipeline)", fontsize=13, fontweight='bold')
+    fig2.suptitle(f"calADC Fixed-Point Hardware Wordlength Sweeps ({base_cfg.eval_bits}-Bit Effective Output)", fontsize=13, fontweight='bold')
     fig2.tight_layout()
     plt.show()
 
     # ==========================================================================
-    # FIGURE 3: STATIC NON-LINEARITY ANALYSIS (SEPARATE UNCAL & CAL PLOTS)
+    # FIGURE 3: STATIC NON-LINEARITY DASHBOARD (UNCAL / CAL ROW LAYOUT)
     # ==========================================================================
     fig3, ((ax3_1, ax3_2), (ax3_3, ax3_4)) = plt.subplots(2, 2, figsize=(13, 9.5))
 
-    # Subplot 1: Uncalibrated DNL
+    # ROW 1: UNCALIBRATED (DNL on Left, INL on Right)
     ax3_1.plot(code_axis_u, dnl_u, color='tab:red', lw=0.8)
-    ax3_1.axhline(0, color='black', lw=0.8, linestyle='--')
-    ax3_1.set_xlabel("Digital Output Code", fontsize=10)
-    ax3_1.set_ylabel("DNL (LSB)", fontsize=10)
+    ax3_1.axhline(0.5, color='black', linestyle=':', lw=0.8)
+    ax3_1.axhline(-0.5, color='black', linestyle=':', lw=0.8)
+    ax3_1.set_xlabel(f"Digital Output Code ({base_cfg.eval_bits}-Bit Grid)", fontsize=10)
+    ax3_1.set_ylabel(f"DNL ({base_cfg.eval_bits}-bit LSB)", fontsize=10)
     ax3_1.set_title(f"1. Uncalibrated DNL (Max |DNL| = {np.max(np.abs(dnl_u)):.2f} LSB)", fontweight='bold')
     ax3_1.grid(True, linestyle=':', alpha=0.6)
 
-    # Subplot 2: Calibrated DNL (Rescaled to show sub-LSB details)
-    ax3_2.plot(code_axis_c, dnl_cal, color='tab:blue', lw=1.0)
-    ax3_2.axhline(0, color='black', lw=0.8, linestyle='--')
-    ax3_2.axhline(0.5, color='crimson', linestyle=':', lw=1.0, label='±0.5 LSB Target')
-    ax3_2.axhline(-0.5, color='crimson', linestyle=':', lw=1.0)
-    ax3_2.set_xlabel("Digital Output Code", fontsize=10)
-    ax3_2.set_ylabel("DNL (LSB)", fontsize=10)
-    ax3_2.set_title(f"2. Calibrated DNL (Max |DNL| = {np.max(np.abs(dnl_cal)):.2f} LSB)", fontweight='bold')
+    ax3_2.plot(code_axis_u, inl_u, color='tab:red', lw=1.0)
+    ax3_2.set_xlabel(f"Digital Output Code ({base_cfg.eval_bits}-Bit Grid)", fontsize=10)
+    ax3_2.set_ylabel(f"INL ({base_cfg.eval_bits}-bit LSB)", fontsize=10)
+    ax3_2.set_title(f"2. Uncalibrated INL (Max |INL| = {np.max(np.abs(inl_u)):.2f} LSB)", fontweight='bold')
     ax3_2.grid(True, linestyle=':', alpha=0.6)
-    ax3_2.legend(loc='upper right', fontsize=8)
 
-    # Subplot 3: Uncalibrated INL
-    ax3_3.plot(code_axis_u, inl_u, color='tab:red', lw=1.0)
-    ax3_3.axhline(0, color='black', lw=0.8, linestyle='--')
-    ax3_3.set_xlabel("Digital Output Code", fontsize=10)
-    ax3_3.set_ylabel("INL (LSB)", fontsize=10)
-    ax3_3.set_title(f"3. Uncalibrated INL (Max |INL| = {np.max(np.abs(inl_u)):.2f} LSB)", fontweight='bold')
+    # ROW 2: CALIBRATED (DNL on Left, INL on Right)
+    ax3_3.plot(code_axis_c, dnl_cal, color='tab:blue', lw=1.0)
+    ax3_3.axhline(0.5, color='black', linestyle=':', lw=0.8)
+    ax3_3.axhline(-0.5, color='black', linestyle=':', lw=0.8)
+    ax3_3.set_xlabel(f"Digital Output Code ({base_cfg.eval_bits}-Bit Grid)", fontsize=10)
+    ax3_3.set_ylabel(f"DNL ({base_cfg.eval_bits}-bit LSB)", fontsize=10)
+    ax3_3.set_title(f"3. Calibrated DNL (Max |DNL| = {np.max(np.abs(dnl_cal)):.2f} LSB)", fontweight='bold')
     ax3_3.grid(True, linestyle=':', alpha=0.6)
 
-    # Subplot 4: Calibrated INL (Rescaled to show sub-LSB details)
-    ax3_4.plot(code_axis_c, inl_cal, color='tab:blue', lw=1.2)
-    ax3_4.axhline(0, color='black', lw=0.8, linestyle='--')
-    ax3_4.set_xlabel("Digital Output Code", fontsize=10)
-    ax3_4.set_ylabel("INL (LSB)", fontsize=10)
+    ax3_4.plot(code_axis_c, inl_cal, color='tab:blue', lw=1.5)
+    ax3_4.set_xlabel(f"Digital Output Code ({base_cfg.eval_bits}-Bit Grid)", fontsize=10)
+    ax3_4.set_ylabel(f"INL ({base_cfg.eval_bits}-bit LSB)", fontsize=10)
     ax3_4.set_title(f"4. Calibrated INL (Max |INL| = {np.max(np.abs(inl_cal)):.2f} LSB)", fontweight='bold')
     ax3_4.grid(True, linestyle=':', alpha=0.6)
 
-    fig3.suptitle(f"calADC Static Linearity Study — Pre- vs. Post-Calibration ({base_cfg.total_bits}-Bit Nominal)", fontsize=13, fontweight='bold')
+    fig3.suptitle(f"calADC Static Non-Linearity Analysis ({base_cfg.eval_bits}-Bit Effective Output Grid)", fontsize=13, fontweight='bold')
     fig3.tight_layout()
     plt.show()
 
