@@ -45,8 +45,8 @@ class CalADCMCConfig:
     # Physical Nominal Values
     Cs_nominal: float = 0.6e-12       # Nominal sampling capacitor (0.6 pF)
     Cf_nominal: float = 0.6e-12       # Nominal feedback capacitor (0.6 pF)
-    ota_a0_db_mean: float = 68.0       # Mean OTA DC open-loop gain (dB)
-    gbw_mean: float = 800e6           # Mean OTA Gain-Bandwidth product (800 MHz)
+    ota_a0_db_mean: float = 72.0       # Mean OTA DC open-loop gain (dB)
+    gbw_mean: float = 400e6           # Mean OTA Gain-Bandwidth product (800 MHz)
     
     # Statistical Standard Deviations (MC Variations across stages & runs)
     ota_a0_db_std: float = 2.0        # OTA DC open-loop gain std dev (2.0 dB)
@@ -347,7 +347,7 @@ class calADC_MC:
     def run_ramp_dnl_inl(self, num_samples=None, use_calibrated=True) -> Tuple[float, float]:
         eval_bits = self.cfg.eval_bits
         if num_samples is None:
-            num_samples = 10 * (2 ** eval_bits)
+            num_samples = 40 * (2 ** eval_bits) # default is 40 steps per code --> 0.025 LSB resolution
 
         vin_ramp = np.linspace(-1.02 * self.Vref, 1.02 * self.Vref, num_samples)
         y_raw = np.zeros(num_samples)
@@ -559,10 +559,12 @@ def run_pipelined_adc_cal_mc(cfg: CalADCMCConfig):
 if __name__ == "__main__":
     # Configuration for 2.5V thick-oxide process Monte Carlo Yield Study
     mc_cfg = CalADCMCConfig(
-        num_mc_runs=50,                # 50 statistical runs
+        num_mc_runs=1,                # 50 statistical runs
         effective_resolution=12,       # Evaluate at 12-bit level
-        num_stages=16,                 # 16 MDAC stages
-        num_calibrated_stages=5,       # Calibrate stages 1-5
+        num_stages=18,                 # 16 MDAC stages
+        num_calibrated_stages=7,       # Calibrate stages 1-5
+        cal_cycles_per_stage=4000,      # default = 2000 
+        mu_shift = 8,                   # default = 8
         
         # Thermal & Reference Noise
         enable_ktc_noise=True,         # Include kT/C sampling noise
@@ -571,11 +573,11 @@ if __name__ == "__main__":
         sigma_vref_noise=150e-6,       # 150 uV RMS
         
         # Mismatches & Variations
-        gain_error_std=0.005,          # 0.5% gain error
-        cap_mismatch_std=0.0008,       # 0.08% cap mismatch
-        ota_a0_db_mean=68.0,           # 68 dB mean gain
+        gain_error_std=0.001,          # 0.5% gain error
+        cap_mismatch_std=0.001,       # 0.08% cap mismatch
+        ota_a0_db_mean=74.0,           # 68 dB mean gain
         ota_a0_db_std=2.5,             # 2.5 dB gain variation
-        gbw_mean=800e6,                # 800 MHz GBW
+        gbw_mean=400e6,                # 800 MHz GBW
         gbw_std_rel=0.08,              # 8% GBW mismatch
         comp_offset_std=0.015          # 15 mV comparator offset
     )
